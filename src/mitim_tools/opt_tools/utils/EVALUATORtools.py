@@ -167,11 +167,18 @@ def mitimRun(
 
     if optimization_data is not None:
         if lock is not None:
+            print(f"[DEBUG AS] Acquiring lock to update optimization_data for evaluation {numEval}")
             lock.acquire()
+        else:
+            print(f"[DEBUG AS] No lock provided for updating optimization_data for evaluation {numEval}")
         _,_,objective = optimization_object.scalarized_objective(torch.from_numpy(y))
+        print(f"[DEBUG AS] Entering update_data_point for evaluation {numEval}")
         optimization_data.update_data_point(x,y,yE,objective=objective.cpu().numpy())
         if lock is not None:
+            print(f"[DEBUG AS] Releasing lock after updating optimization_data for evaluation {numEval}")
             lock.release()
+        else:
+            print(f"[DEBUG AS] No lock to release after updating optimization_data for evaluation {numEval}")
 
     try:
         y_txt = ""

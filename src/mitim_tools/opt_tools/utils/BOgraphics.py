@@ -906,6 +906,7 @@ class optimization_data:
         file,
         forceNew=False,
     ):
+        
         # If start from scratch, overwrite the tabular, otherwise there's risk of error if not all OFs coincide, that's why forceNew
 
         self.file = IOtools.expandPath(file)
@@ -922,10 +923,12 @@ class optimization_data:
         self.data_point_dictionary['maximization_objective'] = np.nan
 
         if forceNew or not self.file.exists():
+            print(f"[DEBUG AS] Optimization data file was created: {file}")
             # Create empty csv
             self.data = pd.DataFrame(columns = self.data_point_dictionary.keys())
             self.data.to_csv(self.file, index=False)
         else:
+            print(f"[DEBUG AS] Optimization data file was read: {file}")
             self.data = pd.read_csv(self.file)
             
         self._validate()
@@ -1001,9 +1004,7 @@ class optimization_data:
         return y, ystd, coincidentPoint
 
     def extract_points(self, points=[0, 1, 2, 3, 4, 5]):
-        print(
-            f"\t* Reading points from file ({self.file})",
-        )
+        print(f"\t* Reading points from file ({self.file})")
 
         self.data = pd.read_csv(self.file)
 
@@ -1032,6 +1033,7 @@ class optimization_data:
             self.data.loc[point, "maximization_objective"] = objective
 
             # Update file
+            print(f"[DEBUG AS] Updating data point {point} in optimization_data file: {self.file}")
             self.data.to_csv(self.file, index=False)
 
     def update_points(self, X, Y=np.array([]), Ystd=np.array([]),objective=None):
@@ -1076,6 +1078,7 @@ class optimization_data:
                         data_new = pd.DataFrame([data_point])  # Initialize if data_new is all-NA
 
         self.data = data_new
+        print(f"[DEBUG AS] Updating multiple data points in optimization_data file: {self.file}")
         self.data.to_csv(self.file, index=False)
 
     def removePointsAfter(self, fromPoint):
