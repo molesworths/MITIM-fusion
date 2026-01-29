@@ -1035,6 +1035,7 @@ class optimization_data:
             # Update file
             print(f"[DEBUG AS] Updating data point {point} in optimization_data file: {self.file}")
             self.data.to_csv(self.file, index=False)
+            self.data.to_csv(self.file+f"_{point}", index=False)
 
     def update_points(self, X, Y=np.array([]), Ystd=np.array([]),objective=None):
 
