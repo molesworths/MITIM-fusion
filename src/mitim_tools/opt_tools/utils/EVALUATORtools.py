@@ -169,6 +169,7 @@ def mitimRun(
         if lock is not None:
             print(f"[DEBUG AS] Acquiring lock to update optimization_data for evaluation {numEval}")
             lock.acquire()
+            print(f"[DEBUG AS] Acquired lock to update optimization_data for evaluation {numEval}")
         else:
             print(f"[DEBUG AS] No lock provided for updating optimization_data for evaluation {numEval}")
         _,_,objective = optimization_object.scalarized_objective(torch.from_numpy(y))
@@ -177,6 +178,7 @@ def mitimRun(
         if lock is not None:
             print(f"[DEBUG AS] Releasing lock after updating optimization_data for evaluation {numEval}")
             lock.release()
+            print(f"[DEBUG AS] Released lock after updating optimization_data for evaluation {numEval}")
         else:
             print(f"[DEBUG AS] No lock to release after updating optimization_data for evaluation {numEval}")
 
