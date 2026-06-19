@@ -35,6 +35,11 @@ Add an ``edge_options`` block alongside the standard ``solution`` block:
       # Swap the targets evaluator for analytical_model_edge
       use_edge_targets : true
 
+      # Global surrogates: fit one GP per turbulent channel spanning the rho domain instead
+      # of one GP per rhoCP. Adds magnetic shear as a radial-location feature and pools the
+      # samples from all rhoCP (converted to gyro-Bohm space) into each turbulent GP.
+      global_surrogates : false
+
     # Optional: edge-UQ uncertainty inflation (applied inside powerstate_edge)
     edge_uq_enable              : true
     edge_uq_calib_dir           : ./results_offline_edge_uq
@@ -522,6 +527,10 @@ def initializeProblem(
         "parameters_combined": {},
     }
 
+    # Global surrogates: tell the fitter to pool samples across rhoCP for the turbulent channels
+    global_surrogates = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("global_surrogates", False))
+    portals_fun.optimization_options["surrogate_options"]["global_surrogates"] = global_surrogates
+
 def prepportals_transformation_variables(portals_fun, ikey, doNotFitOnFixedValues=False):
     allOuts = portals_fun.optimization_options["problem_options"]["ofs"]
     portals_transformation_variables = portals_fun.portals_parameters["solution"]["portals_transformation_variables"][ikey]
@@ -628,6 +637,18 @@ def prepportals_transformation_variables(portals_fun, ikey, doNotFitOnFixedValue
             Variables[output] = ["CZGB"]
         elif typ in ["Mt_tar"]:
             Variables[output] = ["MtGB"]
+
+    # ------------------------------------------------------------------------------------------
+    # Global surrogates: append magnetic shear as a radial-location feature to the turbulent
+    # channels so that a single GP can span the rho domain (samples at different rhoCP are
+    # distinguished by their shear value). Background quantity -> always included when enabled.
+    # ------------------------------------------------------------------------------------------
+    global_surrogates = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("global_surrogates", False))
+    if global_surrogates:
+        for output in list(Variables.keys()):
+            typ = "_".join(output.split("_")[:-1])
+            if typ.endswith("_tr_turb") and ("shear" not in Variables[output]):
+                Variables[output].append("shear")
 
     return Variables
 

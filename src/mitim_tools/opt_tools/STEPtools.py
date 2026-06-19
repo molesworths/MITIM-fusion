@@ -108,6 +108,60 @@ class OPTstep:
         # **** From standard deviation to variance
         self.train_Yvar = self.train_Ystd**2
 
+    def _global_surrogate_added_points(self, outi, i):
+        """
+        Build pooled training points (in physics-transformed feature space) for a global
+        turbulent surrogate by gathering the samples from sibling outputs that share the same
+        channel/category but sit at a different radial position (rhoCP).
+
+        Each sibling's raw DVs (self.x) are passed through the PORTALS input transform *at the
+        sibling's own position*, which yields the local features augmented with that position's
+        magnetic shear. The fluxes are converted to gyro-Bohm (physics-transformed output) space
+        via each sibling's own normalization, because added points are concatenated *after* the
+        physics outcome transform (only standardization is applied to them downstream). In GB
+        space fluxes are comparable across radii, which is exactly what makes pooling valid.
+
+        Returns (X_feat, Y_gb, Yvar_gb) numpy arrays, or None if no siblings exist.
+        """
+        if (self.outputs is None) or ("transformationInputs" not in self.surrogate_parameters):
+            return None
+
+        typ = "_".join(outi.split("_")[:-1])
+        transformationInputs = self.surrogate_parameters["transformationInputs"]
+        transformationOutputs = self.surrogate_parameters.get("transformationOutputs", None)
+        transformation_variables = self.surrogate_parameters["surrogate_transformation_variables_lasttime"]
+
+        # Rows kept in the native fit (avoidPoints are removed inside surrogate_model)
+        keep = np.array([k for k in range(self.x.shape[0]) if k not in self.avoidPoints], dtype=int)
+        if keep.size == 0:
+            return None
+        x_keep = torch.from_numpy(self.x[keep]).to(self.dfT)
+
+        X_list, Y_list, Yvar_list = [], [], []
+        for j, outj in enumerate(self.outputs):
+            if (j == i) or (outj is None) or ("_".join(outj.split("_")[:-1]) != typ):
+                continue
+            with torch.no_grad():
+                xFit, _ = transformationInputs(x_keep, outj, self.surrogate_parameters, transformation_variables)
+                # GB factor at the sibling's position; flux_gb = flux_raw / factor (Standardize with means=0)
+                factor = (
+                    transformationOutputs(x_keep, self.surrogate_parameters, outj).cpu().numpy()
+                    if transformationOutputs is not None
+                    else np.ones((keep.size, 1))
+                )
+            X_list.append(xFit.cpu().numpy())
+            Y_list.append(self.y[keep, j:j + 1] / factor)
+            Yvar_list.append(self.yvar[keep, j:j + 1] / (factor ** 2))
+
+        if len(X_list) == 0:
+            return None
+
+        return (
+            np.concatenate(X_list, axis=0),
+            np.concatenate(Y_list, axis=0),
+            np.concatenate(Yvar_list, axis=0),
+        )
+
     def fit_step(self, avoidPoints=None, fitWithTrainingDataIfContains=None):
         """
         Notes:
@@ -230,6 +284,21 @@ class OPTstep:
                     np.empty((0, y.shape[-1])),
                 )
 
+            # ---------------------------------------------------------------------------------------------------
+            # Global surrogates: pool samples from sibling rhoCP (same channel/category, other positions) into
+            # this output's training set. Each sibling's raw DVs are passed through the physics input transform
+            # at its own radial position, so the pooled points live in the same shear-augmented feature space
+            # and a single GP spans the rho domain.
+            # ---------------------------------------------------------------------------------------------------
+            extra_added_points = None
+            if (
+                self.surrogate_options.get("global_surrogates", False)
+                and (outi is not None)
+                and ("_".join(outi.split("_")[:-1]).endswith("_tr_turb"))
+                and (not specialTreatment)
+            ):
+                extra_added_points = self._global_surrogate_added_points(outi, i)
+
             # Surrogate
 
             print(f"~ Model for output: {outi}")
@@ -247,6 +316,7 @@ class OPTstep:
                 surrogate_options=surrogate_options,
                 FixedValue=FixedValue,
                 fileTraining=fileTraining,
+                extra_added_points=extra_added_points,
             )
 
             # Fitting

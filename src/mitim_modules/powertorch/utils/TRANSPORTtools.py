@@ -133,7 +133,12 @@ class power_transport:
         
         neoclassical = self.evaluate_neoclassical()
         turbulence = self.evaluate_turbulence()
-        
+
+        # Archive the real evaluation's decks + fluxes (opt-in, never fatal).
+        # Done here, before _postprocess, while the GB flux/std arrays and the
+        # per-rho deck objects (turbulence/neoclassical.inputs_files) coexist.
+        self._archive_evaluation(turbulence, neoclassical)
+
         '''
         ******************************************************************************************************
         From the json to powerstate.plasma and GB to real units transformation
@@ -148,6 +153,35 @@ class power_transport:
         ******************************************************************************************************
         '''
         self._postprocess()
+
+    def _archive_evaluation(self, turbulence, neoclassical):
+        """Write the real evaluation to the EvaluationArchive.
+
+        Enabled by default; the archive persists ACROSS runs (that is the point --
+        future solves reuse prior-run neighbours), so the default path is a stable
+        user-level location, NOT the per-run folder:
+            transport_options["archive"]["path"]  ->  $MITIM_EVAL_ARCHIVE  ->  ~/.mitim/evaluation_archive
+        Disable per run with transport_options["archive"] = {"enabled": False}.
+        Wrapped so an archiving failure can never break a transport evaluation.
+        """
+        import os
+        archive_opts = self.powerstate.transport_options.get("archive", {}) \
+            if isinstance(self.powerstate.transport_options, dict) else {}
+        archive_opts = archive_opts or {}
+        if not archive_opts.get("enabled", True):
+            return
+        try:
+            from pathlib import Path
+            from mitim_modules.powertorch.utils.EVALarchive import EvaluationArchive
+            path = archive_opts.get("path") or os.environ.get("MITIM_EVAL_ARCHIVE") \
+                or (Path.home() / ".mitim" / "evaluation_archive")
+            arch = EvaluationArchive(path)
+            records = arch.records_from_transport(self, turbulence, neoclassical)
+            if records:
+                arch.append(records)
+                print(f"\t* [EvaluationArchive] wrote {len(records)} record(s) to {IOtools.clipstr(str(arch.path))}")
+        except Exception as e:
+            print(f"\t* [EvaluationArchive] skipped (non-fatal): {e}", typeMsg="w")
         
     def _postprocess(self):
         '''

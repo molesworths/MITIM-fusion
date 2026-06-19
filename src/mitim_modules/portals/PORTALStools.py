@@ -22,6 +22,12 @@ def surrogate_selection_portals(output, surrogate_options):
             surrogate_options["TypeMean"] = 2  # Linear in gradients, constant in rest
             surrogate_options["TypeKernel"] = 1  # RBF
 
+            # Global surrogates: a single turbulent GP spans the rho domain (samples pooled
+            # across rhoCP, shear added as a radial feature). With sparse, mildly nonstationary
+            # data, Matern-5/2 is more robust than the (infinitely smooth) RBF.
+            if surrogate_options.get("global_surrogates", False) and ("_tr_turb" in output):
+                surrogate_options["TypeKernel"] = 0  # Matern 5/2
+
     surrogate_options["additional_constraints"] = {
         'lenghtscale_constraint': gpytorch.constraints.constraints.GreaterThan(0.05) # inputs normalized to [0,1], this is  5% lengthscale
     }

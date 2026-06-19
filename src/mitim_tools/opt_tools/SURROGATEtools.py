@@ -43,6 +43,7 @@ class surrogate_model:
         surrogate_options={},
         FixedValue=False,
         fileTraining=None,
+        extra_added_points=None,
         seed = 0
     ):
         """
@@ -63,6 +64,7 @@ class surrogate_model:
         self.bounds = bounds
         self.FixedValue = FixedValue
         self.fileTraining = fileTraining
+        self.extra_added_points = extra_added_points
 
         self.losses = None
 
@@ -144,6 +146,24 @@ class surrogate_model:
             self.num_training_points = self.train_X.shape[0] + self.train_X_added_full.shape[0]
             input_transform_physics, outcome_transform_physics, dimTransformedDV_x, dimTransformedDV_y = self._define_physics_transformation()
             # ------------------------------------------------------------------------------------------------------------
+
+            self.train_X_added = (
+                self.train_X_added_full[:, :dimTransformedDV_x] if self.train_X_added_full.shape[-1] > dimTransformedDV_x else self.train_X_added_full
+            ).to(self.dfT)
+
+        elif self.extra_added_points is not None:
+
+            # Points pooled in-memory (already in physics-transformed feature space), e.g. global
+            # surrogates pooling samples across radial positions.
+            X_feat, Y_feat, Yvar_feat = self.extra_added_points
+            print(f"\t* Extending training set with {X_feat.shape[0]} pooled points (global surrogate)", typeMsg="i")
+
+            self.train_X_added_full = torch.from_numpy(np.array(X_feat)).to(self.dfT)
+            self.train_Y_added = torch.from_numpy(np.array(Y_feat)).to(self.dfT)
+            self.train_Yvar_added = torch.from_numpy(np.array(Yvar_feat)).to(self.dfT)
+
+            self.num_training_points = self.train_X.shape[0] + self.train_X_added_full.shape[0]
+            input_transform_physics, outcome_transform_physics, dimTransformedDV_x, dimTransformedDV_y = self._define_physics_transformation()
 
             self.train_X_added = (
                 self.train_X_added_full[:, :dimTransformedDV_x] if self.train_X_added_full.shape[-1] > dimTransformedDV_x else self.train_X_added_full

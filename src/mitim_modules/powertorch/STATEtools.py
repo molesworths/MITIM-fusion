@@ -670,6 +670,15 @@ class powerstate:
         self.plasma["tite"] = self.plasma["ti"] / self.plasma["te"]
         self.plasma["fZ"] = self.plasma["nZ"] / self.plasma["ne"]
         self.plasma["beta_e"] = PLASMAtools.betae(self.plasma["te"], self.plasma["ne"] * 1e-1, self.plasma["B_unit"])
+
+        # Magnetic shear s = (r/q) dq/dr, computed on the full radial grid (q is a fixed
+        # background, so this is robust even when only a few rhoCP are used). Used as a
+        # global-surrogate feature to label radial position (see global_surrogates option).
+        roa = self.plasma["roa"]
+        q = self.plasma["q"]
+        roa1d = roa[0] if roa.dim() > 1 else roa
+        dq_droa = torch.gradient(q, spacing=(roa1d,), dim=-1)[0]
+        self.plasma["shear"] = (roa / q.clamp_min(1e-8)) * dq_droa
         
         aLni = [self.plasma[f"aLni{i}"] for i in range(self.plasma["ni"].shape[-1])]
         
