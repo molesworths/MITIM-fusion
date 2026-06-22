@@ -981,28 +981,15 @@ class optimization_data:
         _, point = self.find_point(x)
 
         if point is None:
-            # Point doesn't exist, add it as a new row
-            data_point = copy.deepcopy(self.data_point_dictionary)
-            data_point['Iteration'] = len(self.data)
-
-            for j in range(len(x)):
-                data_point[self.inputs[j]] = x[j]
-
-            for j in range(len(self.outputs)):
-                data_point[self.outputs[j]] = y[j]
-                data_point[self.outputs[j] + "_std"] = ystd[j]
-
-            data_point['maximization_objective'] = objective
-
-            # Add the new point to the dataframe
-            self.data = pd.concat([self.data, pd.DataFrame([data_point])], ignore_index=True)
+            print("Point not found", typeMsg="q")
         else:
             self.data.loc[point, self.outputs] = y
             self.data.loc[point, [i + "_std" for i in self.outputs]] = ystd
+
             self.data.loc[point, "maximization_objective"] = objective
 
-        # Update file
-        self.data.to_csv(self.file, index=False)
+            # Update file
+            self.data.to_csv(self.file, index=False)
 
     def update_points(self, X, Y=np.array([]), Ystd=np.array([]),objective=None):
 
