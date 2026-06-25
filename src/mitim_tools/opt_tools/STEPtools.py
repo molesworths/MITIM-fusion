@@ -414,13 +414,29 @@ class OPTstep:
 
         self.evaluators = {"GP": self.GP["combined_model"]}
 
+        # Some optimization objects (e.g. PORTALS-Edge) accept the design vector X
+        # as a second argument to inject analytic LCFS soft-prior residuals
+        # (lcfs_bc_model.md section 6). Detect this once so the hot acquisition
+        # path stays branch-cheap and remains backward compatible with the
+        # standard Y-only signature.
+        import inspect
+        try:
+            _accepts_X = len(inspect.signature(scalarized_objective).parameters) >= 2
+        except (TypeError, ValueError):
+            _accepts_X = False
+
+        def _scalarized(Y, X=None):
+            if _accepts_X:
+                return scalarized_objective(Y, X)
+            return scalarized_objective(Y)
+
         # **************************************************************************************************
         # Objective (multi-objective model -> single objective residual)
         # **************************************************************************************************
 
         # Build function to pass to acquisition
         def residual(Y, X = None):
-            return scalarized_objective(Y)[2]
+            return _scalarized(Y, X)[2]
 
         self.evaluators["objective"] = botorch.acquisition.objective.GenericMCObjective(residual)
 
@@ -430,7 +446,7 @@ class OPTstep:
 
         def residual_function(x, outputComponents=False):
             mean, _, _, _ = self.evaluators["GP"].predict(x) #TODO: make the predict method simply the callable of my GP
-            yOut_fun, yOut_cal, yOut = scalarized_objective(mean)
+            yOut_fun, yOut_cal, yOut = _scalarized(mean, x)
 
             return (yOut, yOut_fun, yOut_cal, mean) if outputComponents else yOut
 

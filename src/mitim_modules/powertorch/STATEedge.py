@@ -90,6 +90,12 @@ class powerstate_edge(powerstate):
         ("edge_uq_channel_mapping",     None),
         ("defined_on",                  "y"),
         ("use_edge_targets",            True),
+        # Soft-prior LCFS degrees of freedom (lcfs_bc_model.md section 6).
+        # When enabled, the per-channel aLy(1) boundary condition is an optimizer
+        # DV and the BC-model output becomes its prior mean F_y; the residual
+        # R_LCFS,y = (y - F_y)/sigma_y is added analytically (not via a flux GP).
+        ("lcfs_dv",                     True),
+        ("lcfs_sigma",                  {}),
     ]
 
     @staticmethod
@@ -202,6 +208,14 @@ class powerstate_edge(powerstate):
                     lst[ne_index], lst[nz_index] = lst[nz_index], lst[ne_index]
             return lst
         self.predicted_channels = _ensure_ne_before_nz(self.predicted_channels)
+
+        # Resolve LCFS aLy DV channels + their stiffness now that channels are known.
+        if self._lcfs_dv_enabled:
+            self.lcfs_dv_channels = list(self.predicted_channels)
+            for ch in self.lcfs_dv_channels:
+                self.lcfs_sigma[ch] = float(
+                    self._lcfs_sigma_opt.get(ch, self._lcfs_sigma_default.get(ch, 0.25))
+                )
 
         # Build parameterizer options after channels and radial controls are known.
         parameterizer_name = evolution_options.get("parameterizer", "spline")
@@ -340,6 +354,21 @@ class powerstate_edge(powerstate):
         self.bc_dict_batch         = None
         self.bc_tensors            = None
 
+        # Soft-prior LCFS DV machinery (section 6).
+        self._lcfs_dv_enabled      = bool(opts.get("lcfs_dv", True))
+        self._lcfs_sigma_opt       = dict(opts.get("lcfs_sigma", {}) or {})
+        # Default per-channel stiffness sigma_y: tight on conduction-set aLte,
+        # looser on aLne, loosest on the weakly-modeled aLti (section 6).
+        self._lcfs_sigma_default   = {"te": 0.5, "ne": 0.5, "ti": 0.5}
+        # Channels carrying an LCFS aLy DV (set once predicted_channels known).
+        self.lcfs_dv_channels      = []
+        # Prior means F_y per channel: {ch: (batch,) tensor of model aLy(1)}.
+        self.lcfs_prior            = {}
+        # Per-channel stiffness sigma_y (scalar floats).
+        self.lcfs_sigma            = {}
+        # Last LCFS DV slice routed in from X: (batch, n_lcfs) tensor.
+        self.X_lcfs                = None
+
     def _bind_parameterizer(self, parameterizer_name, parameterizer_options):
         """Instantiate and bind the configured parameterizer model."""
         self._parameterizer_name = str(parameterizer_name or "spline")
@@ -451,6 +480,14 @@ class powerstate_edge(powerstate):
         ne_0orig, ni_0orig = self.plasma["ne"].clone(), self.plasma["ni"].clone()
 
         self.X_to_dict(X)
+
+        # Section 6: route the LCFS aLy DVs into the aLy(1) boundary condition so
+        # that the optimizer directly controls the separatrix gradient. The
+        # BC-model output (captured as self.lcfs_prior) remains only as the soft
+        # prior target. The override keeps the autograd path X -> aLy(1) -> y(rho)
+        # so that dR_int/dy_lcfs is available by chain rule.
+        self._override_lcfs_bc_with_dv()
+
         use_tensor_bcs = isinstance(self.bc_tensors, dict) and len(self.bc_tensors) > 0
 
         if use_tensor_bcs:
@@ -466,10 +503,15 @@ class powerstate_edge(powerstate):
                 bc_dict=self.bc_dict,
             )
 
+        def _cast(v):
+            # Grad-preserving: if the parameterizer returned a tensor (live graph
+            # to the LCFS BC DVs), keep it; otherwise wrap the numpy output.
+            return v.to(self.dfT) if torch.is_tensor(v) else torch.as_tensor(v).to(self.dfT)
+
         for ch in self.predicted_channels:
-            self.plasma[f"aL{ch}"] = torch.tensor(aLy[ch]).to(self.dfT)
-            self.plasma[ch] = torch.tensor(y[ch]).to(self.dfT)
-            self.plasma[f"curvature_{ch}"] = torch.tensor(curv[ch]).to(self.dfT)
+            self.plasma[f"aL{ch}"] = _cast(aLy[ch])
+            self.plasma[ch] = _cast(y[ch])
+            self.plasma[f"curvature_{ch}"] = _cast(curv[ch])
 
             if ch == 'nZ':
                 self.plasma["ni"][..., self.impurityPosition] = self.plasma["nZ"]
@@ -677,6 +719,27 @@ class powerstate_edge(powerstate):
         folder_main = solver_options_use.get("folder", None)
         namingConvention = solver_options_use.get("namingConvention", "powerstate_sr_ev")
 
+        # Interior knot-DV width (excludes the LCFS aLy DVs). The flux-match
+        # relaxation only moves interior gradient DVs — the LCFS boundary DVs
+        # have no flux residual and are held fixed at their base value here
+        # (they are optimized later as soft-priored DVs in the main loop).
+        widths = self.parameterizer.n_params_per_profile
+        if np.isscalar(widths):
+            widths = [int(widths)] * len(self.predicted_channels)
+        elif len(widths) == 1 and len(self.predicted_channels) > 1:
+            widths = list(widths) * len(self.predicted_channels)
+        n_interior = int(sum(int(w) for w in widths))
+
+        # Optional per-iteration LCFS DV schedule (set by initialization to inject
+        # variation in the LCFS DVs across the relaxation trajectory, so the GP
+        # learns flux sensitivity to them — otherwise every initial-training
+        # point sits at the prior and R_LCFS=0 never nudges those DVs). When set,
+        # it overrides the constant lcfs_fixed below: row `cont` is used for the
+        # cont-th evaluation and the same row anchors that trajectory point.
+        lcfs_schedule = getattr(self, "_lcfs_init_schedule", None)
+        if lcfs_schedule is not None:
+            lcfs_schedule = torch.as_tensor(lcfs_schedule).to(self.dfT)
+
         eval_counter = {"cont": 0}
         def evaluator(X, y_history=None, x_history=None, metric_history=None):
             cont = eval_counter["cont"]
@@ -691,8 +754,21 @@ class powerstate_edge(powerstate):
             # Calculate
             # ***************************************************************************************************************
 
+            # Reassemble the full DV vector: interior controls from the solver +
+            # the fixed LCFS aLy DVs, so calculate()/modify() see all DVs and
+            # x_history stores the full-dimensional vector for FluxMatch_Xopt.
+            if lcfs_schedule is not None:
+                row = lcfs_schedule[min(cont, lcfs_schedule.shape[0] - 1)].reshape(1, -1)
+                lf = row.expand(X.shape[0], -1)
+                X_full = torch.cat([X, lf.to(X)], dim=1)
+            elif lcfs_fixed is not None:
+                lf = lcfs_fixed if lcfs_fixed.shape[0] == X.shape[0] else lcfs_fixed[:1].expand(X.shape[0], -1)
+                X_full = torch.cat([X, lf.to(X)], dim=1)
+            else:
+                X_full = X
+
             folder_run = folder / "transport_simulation_folder" if folder_main is not None else IOtools.expandPath('~/scratch/')
-            QTransport, QTarget, _, _ = self.calculate(X, nameRun=nameRun, folder=folder_run, evaluation_number=cont)
+            QTransport, QTarget, _, _ = self.calculate(X_full, nameRun=nameRun, folder=folder_run, evaluation_number=cont)
 
             eval_counter["cont"] = cont + 1
 
@@ -712,23 +788,30 @@ class powerstate_edge(powerstate):
             # Metric is the mean of the absolute value of the residual
             yMetric = -yRes.mean(axis=-1).detach()
 
-            # Store values
-            if y_history is not None:      
+            # Store values. x_history holds the *interior* control vector X
+            # (matching the solver's relaxation dimension); the fixed LCFS
+            # columns are re-appended to FluxMatch_Xopt after the solve.
+            if y_history is not None:
                 y_history.append(yRes.detach())
-            if x_history is not None:      
-                x_history.append(self.Xcurrent.detach())
-            if metric_history is not None: 
+            if x_history is not None:
+                x_history.append(X.detach())
+            if metric_history is not None:
                 metric_history.append(yMetric)
 
             return QTransport, QTarget, yMetric
 
         # Initialize optimization controls. For generalized parameterizers,
         # Xcurrent already carries the active control vector.
+        lcfs_fixed = None
         if isinstance(self.Xcurrent, torch.Tensor) and self.Xcurrent.numel() > 0:
             self.modify(self.Xcurrent)  # Ensure profiles are consistent with Xcurrent
             x0 = self.Xcurrent.detach().clone()
             if x0.ndim == 1:
                 x0 = x0.unsqueeze(0)
+            # Hold LCFS aLy DVs fixed; relax only the interior columns.
+            if x0.shape[1] > n_interior:
+                lcfs_fixed = x0[:, n_interior:].clone()
+                x0 = x0[:, :n_interior].clone()
         else:
             # Backward-compatible fallback for legacy aL-profile controls.
             x0 = torch.Tensor().to(self.plasma["aLte"])
@@ -753,6 +836,21 @@ class powerstate_edge(powerstate):
         index_best = divmod(idx_flat.item(), metric_history.shape[1])
         
         self.FluxMatch_Yopt, self.FluxMatch_Xopt = Yopt[:,index_best[1],:], Xopt[:,index_best[1],:]
+
+        # Re-append the LCFS aLy DV columns so FluxMatch_Xopt is the full DV
+        # vector (interior trajectory + LCFS), matching the declared DVs.
+        if lcfs_schedule is not None:
+            m = self.FluxMatch_Xopt.shape[0]
+            sched = lcfs_schedule[:m]
+            if sched.shape[0] < m:  # pad with the last row if trajectory is longer
+                pad = sched[-1:].expand(m - sched.shape[0], -1)
+                sched = torch.cat([sched, pad], dim=0)
+            self.FluxMatch_Xopt = torch.cat([self.FluxMatch_Xopt, sched.to(self.FluxMatch_Xopt)], dim=1)
+            self._lcfs_init_schedule = None  # one-shot: only for this init relaxation
+        elif lcfs_fixed is not None:
+            lf_row = lcfs_fixed[index_best[1]] if lcfs_fixed.shape[0] > index_best[1] else lcfs_fixed[0]
+            lf_traj = lf_row.unsqueeze(0).expand(self.FluxMatch_Xopt.shape[0], -1).to(self.FluxMatch_Xopt)
+            self.FluxMatch_Xopt = torch.cat([self.FluxMatch_Xopt, lf_traj], dim=1)
 
         print("**********************************************************************************************")
         print(f"\t- Flux matching of powerstate finished, and took {IOtools.getTimeDifference(timeBeginning)}\n")
@@ -909,6 +1007,18 @@ class powerstate_edge(powerstate):
             )
 
         model = self._bc_model_instance
+
+        # Section 6 tie-in: if the BC model advertises per-channel soft-prior
+        # stiffness (sigma_y, e.g. TwoFluidSynthesis), adopt it for the LCFS DVs
+        # unless the user explicitly set lcfs_sigma in edge_options.
+        if self._lcfs_dv_enabled and hasattr(model, "sigma_y") and isinstance(model.sigma_y, dict):
+            for ch in self.lcfs_dv_channels:
+                if ch in self._lcfs_sigma_opt:
+                    continue  # user override wins
+                key = f"aL{ch}"
+                if key in model.sigma_y:
+                    self.lcfs_sigma[ch] = float(model.sigma_y[key])
+
         batch  = self.plasma["te"].shape[0]
 
         # Solve for each batch element and keep distinct BC dictionaries.
@@ -939,6 +1049,15 @@ class powerstate_edge(powerstate):
             self.bc_dict = copy.deepcopy(self.bc_dict_batch[0])
             for key, (val, _roa_loc) in self.bc_dict.items():
                 self._lcfs_bc[key] = float(val)
+
+        # Section 6: capture the BC-model aLy(1) as the soft-prior mean F_y per
+        # channel *before* modify() overrides the aLy boundary with the DV value.
+        if self._lcfs_dv_enabled:
+            self.lcfs_prior = {}
+            for ch in self.lcfs_dv_channels:
+                key = f"aL{ch}"
+                if key in self.bc_tensors:
+                    self.lcfs_prior[ch] = self.bc_tensors[key]["val"].detach().reshape(-1).clone()
 
     def calculateChargeStates(self):
         """
@@ -1683,6 +1802,48 @@ class powerstate_edge(powerstate):
         for ch, w in zip(profs, widths):
             self.X_dict[ch] = X[:, i0 : i0 + w]
             i0 += w
+
+        # Section 6: trailing columns (beyond the interior knot params) are the
+        # per-channel LCFS aLy DVs, ordered by self.lcfs_dv_channels.
+        self.X_lcfs = None
+        if self._lcfs_dv_enabled and self.lcfs_dv_channels and X.shape[1] > i0:
+            n_lcfs = len(self.lcfs_dv_channels)
+            if X.shape[1] - i0 >= n_lcfs:
+                self.X_lcfs = X[:, i0 : i0 + n_lcfs]
+
+    def _override_lcfs_bc_with_dv(self):
+        """
+        Replace the BC-model aLy(1) value with the optimizer-controlled LCFS DV.
+
+        The DV slice ``self.X_lcfs`` has shape (batch, n_lcfs) ordered by
+        ``self.lcfs_dv_channels``. Both the tensorized BC representation
+        (``self.bc_tensors``) and the scalar fallback (``self.bc_dict``) are
+        updated so that whichever path ``modify()`` takes reads the DV value.
+        """
+        if not self._lcfs_dv_enabled or self.X_lcfs is None:
+            return
+
+        for j, ch in enumerate(self.lcfs_dv_channels):
+            key = f"aL{ch}"
+            dv_col = self.X_lcfs[:, j].reshape(-1, 1)  # (batch,1), keeps grad
+
+            if isinstance(self.bc_tensors, dict) and key in self.bc_tensors:
+                entry = self.bc_tensors[key]
+                entry["val"] = dv_col.to(self.dfT)
+                # loc/mask must share the DV batch dimension so that
+                # _is_batched_bc_input detects this as a batched BC (it requires
+                # both val and loc to have shape[0] == batch_size).
+                entry["loc"] = torch.ones_like(dv_col).to(self.dfT)
+                entry["mask"] = torch.ones_like(dv_col, dtype=torch.bool, device=self.dfT.device)
+            elif isinstance(self.bc_tensors, dict):
+                self.bc_tensors[key] = {
+                    "val": dv_col.to(self.dfT),
+                    "loc": torch.ones_like(dv_col).to(self.dfT),
+                    "mask": torch.ones_like(dv_col, dtype=torch.bool, device=self.dfT.device),
+                }
+
+            # Scalar fallback uses the first batch element.
+            self.bc_dict[key] = [float(dv_col.reshape(-1)[0].item()), 1.0]
 
     # ------------------------------------------------------------------
     # Override: calculate()

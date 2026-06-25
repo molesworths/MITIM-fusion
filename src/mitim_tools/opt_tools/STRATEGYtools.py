@@ -334,6 +334,37 @@ class opt_evaluator:
         return self_complete
 
 
+def _scalarized_objective_with_X(optimization_object, Y, X=None):
+    """
+    Call ``optimization_object.scalarized_objective``, threading the design
+    vector ``X`` when the object's signature accepts it (e.g. PORTALS-Edge with
+    LCFS soft-prior DVs). This keeps the reported/best residual and the
+    convergence metric consistent with the acquisition objective, which already
+    receives ``X`` (lcfs_bc_model.md section 6). Backward compatible with the
+    standard Y-only signature.
+    """
+    import inspect
+
+    try:
+        accepts_X = len(inspect.signature(optimization_object.scalarized_objective).parameters) >= 2
+    except (TypeError, ValueError):
+        accepts_X = False
+
+    if accepts_X and X is not None:
+        Xt = X.to(Y) if isinstance(X, torch.Tensor) else torch.as_tensor(X).to(Y)
+        # train_X may carry freshly-appended candidate rows whose Y is not yet
+        # evaluated (train_Y maps to the leading rows of train_X). Align row
+        # counts so the LCFS residual block broadcasts against the flux source;
+        # if X has fewer rows than Y we cannot align, so drop the X path.
+        if Xt.shape[0] != Y.shape[0]:
+            if Xt.shape[0] > Y.shape[0]:
+                Xt = Xt[: Y.shape[0]]
+            else:
+                return optimization_object.scalarized_objective(Y)
+        return optimization_object.scalarized_objective(Y, Xt)
+    return optimization_object.scalarized_objective(Y)
+
+
 # Main BO class that performs optimization
 class MITIM_BO:
     def __init__(
@@ -958,7 +989,7 @@ class MITIM_BO:
         self.train_X = np.append(self.train_X, self.x_next.cpu(), axis=0)
 
         # Update optimization_data with nans
-        _,_,objective = self.optimization_object.scalarized_objective(torch.from_numpy(self.train_Y))
+        _,_,objective = _scalarized_objective_with_X(self.optimization_object, torch.from_numpy(self.train_Y), self.train_X)
         self.optimization_data.update_points(self.train_X, Y=self.train_Y, Ystd=self.train_Ystd, objective=objective.cpu().numpy())
 
         # Update optimization_results only as "predicted"
@@ -1004,7 +1035,7 @@ class MITIM_BO:
         # ---------------------------------------------------------------------------------------------------------------------
 
         # Update Tabular data with the actual evaluations
-        _,_,objective = self.optimization_object.scalarized_objective(torch.from_numpy(self.train_Y))
+        _,_,objective = _scalarized_objective_with_X(self.optimization_object, torch.from_numpy(self.train_Y), self.train_X)
         self.optimization_data.update_points(self.train_X, Y=self.train_Y, Ystd=self.train_Ystd, objective=objective.cpu().numpy())
 
         # Update optimization_results with the actual evaluations
@@ -1260,7 +1291,7 @@ class MITIM_BO:
         # -----------------------------------------------------------------
 
         # Write initialization in Tabular
-        _,_,objective = self.optimization_object.scalarized_objective(torch.from_numpy(self.train_Y))
+        _,_,objective = _scalarized_objective_with_X(self.optimization_object, torch.from_numpy(self.train_Y), self.train_X)
         self.optimization_data.update_points(self.train_X, Y=self.train_Y, Ystd=self.train_Ystd, objective=objective.cpu().numpy())
 
         # Write optimization_results
@@ -1305,7 +1336,7 @@ class MITIM_BO:
                 f"\t- Points {self.avoidPoints_failed} are avoided b/c at least one of the OFs could not be computed"
             )
         # ------------------
-        _,_,objective = self.optimization_object.scalarized_objective(torch.from_numpy(self.train_Y))
+        _,_,objective = _scalarized_objective_with_X(self.optimization_object, torch.from_numpy(self.train_Y), self.train_X)
         self.optimization_data.update_points(self.train_X, Y=self.train_Y, Ystd=self.train_Ystd, objective=objective.cpu().numpy())
         self.optimization_results.addPoints(
             includePoints=[0, self.Originalinitial_training],
@@ -1875,8 +1906,8 @@ class MITIM_wLM(MITIM_BO):
         5. Check convergence via the average weighted-gradient magnitude
            |J^T Sigma_F^-1 mu_F|
 
-    Phase 3 (x_lcfs feasibility) runs once at convergence: see
-    _assess_lcfs_feasibility.
+    The LCFS boundary degrees of freedom are first-class soft-priored DVs
+    inside this same loop (see _append_lcfs_prior_rows).
     """
 
     _wlm_defaults = {
@@ -1897,18 +1928,6 @@ class MITIM_wLM(MITIM_BO):
         "rho_base":         1.0,   # rho_base in rho_i = rho_base * (x_i/x_ref) * (lambda_max/lambda)
         "x_ref":            1.0,   # reference DV magnitude for the penalty scaling (problem-dependent)
         "active_dual_tol":  1e-8,  # |dual| above which a monotonicity row is reported "active"
-
-        # --- Phase 3: x_lcfs feasibility (switchable; no-op unless Sigma_lcfs is set) ---
-        "lcfs_feasibility_enabled": True,
-        "Sigma_lcfs":          {},     # {channel: sigma}, channel = plain physical name ("te"/"ti"/"ne") regardless of which bc_dict family is perturbed (see y_or_aly). sigma is normally a scalar (applied to whichever single family y_or_aly selects); in "both" mode it may instead be a 2-sequence/dict (sigma_y, sigma_aly) / {"y":.., "aly":..} giving independent per-family values -- needed because the "y" and "aly" bc_dict families generally live on different scales (e.g. keV vs a dimensionless gradient-scale-length ratio), so one absolute number cannot mean both at once. A bare scalar in "both" mode is applied identically to each family, which is only dimensionally sound when sigma_is_rel=True (a relative fraction is scale-free).
-        "sigma_is_rel":        False,  # if True, each resolved sigma is a *fraction* of that family's own nominal BC value: sigma_abs = sigma_rel * |bc_dict[key][0]| -- this is what makes a single scalar Sigma_lcfs[channel] dimensionally consistent across both families in "both" mode
-        "y_or_aly":            "y",    # which bc_dict family to perturb per channel: "y" -> plain value keys ("te"/"ti"/"ne"), "aly" -> gradient keys ("aLte"/"aLti"/"aLne"), "both" -> probe both families independently per channel (2x the candidates: each gets its own bracket and re-optimization)
-        "lcfs_n_sigma":        2.0,    # truncation half-width (in units of sigma) for the Phase-3 joint MC draws: each x_lcfs is drawn from a truncated normal N(nominal, sigma_abs^2) clipped to nominal +/- n_sigma*sigma_abs (keeps draws inside the modeled prior and limits GP extrapolation through the bc->feature path)
-        "lcfs_n_samples":      64,    # number of joint Monte Carlo x_lcfs draws in Phase 3 (all channels/families perturbed together per draw, then x_int re-optimized on the GP). Surrogate-only, so this can be large; only the best draw is further refined.
-        "lcfs_reopt_max_iter": 5,      # cap on re-optimization iterations per MC draw (warm-started from x_int_star -- small perturbation, should converge fast)
-        "lcfs_refine_n_evals": 0,      # number of real-model evaluations with inner wLM refinement at the best-found x_lcfs. If 0, only perform one confirmation check; if > 0, iteratively refine x_int at the best x_lcfs with this many real evals (like phase 2 but anchored to the converged LCFS BC).
-        "lcfs_reopt_refine_max_iter": 3,  # cap on inner wLM iterations per refinement evaluation (refinement warm-starts are tighter than MC exploration, so fewer iterations suffice)
-        "lcfs_n_jitter_evals": 2,      # real-model evaluations at x_int_star with x_lcfs drawn uniformly from the full bracket, run before the surrogate Phase 3 re-optimizations; enriches the training set at convergence (where the GP is already well-trained on x_int), rather than at initialization where x_lcfs variation looks like noise
     }
 
     def __init__(self, optimization_object, wlm_options=None, **kwargs):
@@ -1936,36 +1955,11 @@ class MITIM_wLM(MITIM_BO):
 
         self._qp_warm_start = None
         self._active_mono_duals = {}
-        self.lcfs_feasibility_report = None
 
-    # ------------------------------------------------------------------
-    # run(): fully inherited outer loop, plus a single Phase-3 assessment
-    # at the converged point (not every outer step -- each candidate now
-    # requires a full capped, warm-started re-optimization, so probing it
-    # at every iteration would multiply the cost of the whole run).
-    # ------------------------------------------------------------------
-
-    def run(self):
-        super().run()
-
-        if not self.steps or "combined_model" not in self.steps[-1].GP:
-            return
-
-        combined_gp = self.steps[-1].GP["combined_model"]
-        ind_best = self.BOmetrics["overall"]["indBest"]
-        x_star = torch.tensor(self.train_X[ind_best]).to(self.dfT)
-
-        # Optional pre-step: real evaluations at varied x_lcfs + GP retraining.
-        # Runs before Phase 3 so _assess_lcfs_feasibility uses a GP that has
-        # seen the x_lcfs bracket (at convergence, where the GP is already well
-        # trained on x_int; doing this at initialization degrades early BO).
-        n_jitter = max(0, int(self.wlm_options.get("lcfs_n_jitter_evals", 0)))
-        if (n_jitter > 0
-                and self.wlm_options["lcfs_feasibility_enabled"]
-                and self.wlm_options["Sigma_lcfs"]):
-            combined_gp = self._run_lcfs_jitter_and_retrain(x_star, n_jitter)
-
-        self.lcfs_feasibility_report = self._assess_lcfs_feasibility(x_star, combined_gp)
+    # run() is fully inherited from MITIM_BO. The LCFS boundary degrees of
+    # freedom are now first-class soft-priored DVs optimized inside the main
+    # weighted-LM loop (see _append_lcfs_prior_rows), so the former Phase-3
+    # x_lcfs feasibility / Monte-Carlo machinery has been removed.
 
     # ------------------------------------------------------------------
     # Monotonicity grouping: aL{channel}_{position}, ordered per channel
@@ -1977,22 +1971,35 @@ class MITIM_wLM(MITIM_BO):
         channel (ordered by radial position) for the soft-monotonicity
         constraint  x_int[i_hi] - x_int[i_lo] + s >= 0.
 
-        Convention assumption: monotonicity is enforced per profile channel
-        across its own radial sequence (e.g. aLte_1 < aLte_2 < ...), not as
-        one global chain across mixed-channel DOFs -- derived directly from
+        Monotonicity is enforced ONLY between consecutive *interior* knot DVs of
+        the same channel (ordered by radial/knot position). LCFS boundary DVs
+        (name suffix ``_lcfs``) are explicitly excluded -- they are single,
+        soft-priored separatrix gradients, not part of any interior radial chain.
+
+        Interior DV names follow either ``{channel}_aLy{pos}`` /
+        ``{channel}_d{pos}`` (current parameterizers) or the legacy
+        ``aL{channel}_{pos}`` form; both are recognized. Derived from
         self.bounds (DV order) rather than assumed.
         """
         dv_names = list(self.bounds.keys())
-        pattern = re.compile(r"^aL(?P<channel>.+)_(?P<position>\d+)$")
+        patterns = [
+            re.compile(r"^(?P<channel>.+)_aLy(?P<position>\d+)$"),   # {ch}_aLy{i}
+            re.compile(r"^(?P<channel>.+)_d(?P<position>\d+)$"),      # {ch}_d{i} (dy knots)
+            re.compile(r"^aL(?P<channel>.+)_(?P<position>\d+)$"),     # legacy aL{ch}_{i}
+        ]
 
         channel_groups = {}
         for idx, name in enumerate(dv_names):
-            m = pattern.match(str(name))
-            if not m:
-                continue
-            channel_groups.setdefault(m.group("channel"), []).append(
-                (int(m.group("position")), idx)
-            )
+            sname = str(name)
+            if sname.endswith("_lcfs"):
+                continue  # exclude LCFS boundary DVs from monotonicity
+            for pattern in patterns:
+                m = pattern.match(sname)
+                if m:
+                    channel_groups.setdefault(m.group("channel"), []).append(
+                        (int(m.group("position")), idx)
+                    )
+                    break
 
         pairs = []
         for channel, entries in channel_groups.items():
@@ -2057,6 +2064,23 @@ class MITIM_wLM(MITIM_BO):
         x_in = x.detach().clone()
         mu_F, J = multivariate_tools.mitim_jacobian(residual_fn, x_in, vectorize=True)
 
+        # LCFS aLy DVs: these columns are filled by a chain-rule split
+        # (lcfs_bc_model.md section 6). The LCFS DVs are not GP inputs, so the
+        # autograd Jacobian above is zero in their columns. Rather than FD the flux
+        # residual through the whole GP posterior (weak lever, smoothing noise), or
+        # use the torch parameterizer path directly (frozen-shape: drops the
+        # dominant re-fit term dtheta/d(aLy_lcfs)), we split at the GP-feature
+        # boundary phi (the physics input transform tf1 output):
+        #     dR/d(aLy_lcfs) = (dR/dphi) [GP autograd] . (dphi/d(aLy_lcfs)) [param FD]
+        # A = dR/dphi is exact autograd through the clean feature->posterior path;
+        # B = dphi/d(aLy_lcfs) re-runs the numpy parameterizer (incl. the re-fit),
+        # so the dominant term is captured, and the FD lever is strong/low-noise.
+        J = self._lcfs_columns_via_chain(combined_gp, x_in, J)
+
+        # Transitional cross-check against the legacy full-GP-residual FD.
+        if getattr(self, "_verify_lcfs_columns", False):
+            self._verify_lcfs_flux_columns(residual_fn, x_in, mu_F.detach(), J)
+
         with torch.no_grad():
             y_mean, y_upper, y_lower, _ = combined_gp.predict(x_in.unsqueeze(0))
             sigma_y = (y_upper - y_lower).squeeze(0).abs() / (2.0 * stds)
@@ -2071,7 +2095,238 @@ class MITIM_wLM(MITIM_BO):
 
         Sigma_F_diag = ((G.detach() ** 2) @ Sigma_y_diag).clamp(min=1e-12)
 
-        return mu_F.detach(), Sigma_F_diag, J.detach()
+        mu_F, Sigma_F_diag, J = self._append_lcfs_prior_rows(
+            x_in, mu_F.detach(), Sigma_F_diag, J.detach()
+        )
+
+        return mu_F, Sigma_F_diag, J
+
+    def _lcfs_columns_via_chain(self, combined_gp, x, J):
+        """Fill the LCFS Jacobian columns via the feature chain-rule split.
+
+        ``J[:, j] = A @ B[:, j]`` for each LCFS DV ``j``, where the split is taken
+        at the GP physics-feature boundary ``phi`` (the per-submodel input
+        transform ``tf1`` output):
+
+        * ``A = dR/dphi`` -- autograd of the flux residual w.r.t. ``phi``,
+          obtained by injecting a zero-valued leaf offset ``eps`` onto each
+          submodel's ``tf1`` output (forward hook) and differentiating the full
+          ``predict -> scalarized_objective`` with ``mitim_jacobian``. Everything
+          downstream of ``phi`` (normalization, kernel, GB outcome factor at the
+          true ``x``) runs normally, so ``A`` is exact and in real units.
+        * ``B = dphi/d(aLy_lcfs)`` -- central FD of ``tf1(x)`` (the numpy
+          parameterizer map; no GP posterior), so it re-runs the SplineMtanh
+          re-fit and captures the dominant ``dtheta/d(aLy_lcfs)`` term.
+
+        Interior columns of ``J`` (GP inputs) are left untouched.
+        """
+        opt = getattr(self, "optimization_object", None)
+        ps = getattr(opt, "powerstate", None)
+        names = getattr(opt, "_lcfs_dv_names", None)
+        if opt is None or ps is None or not names or not getattr(ps, "_lcfs_dv_enabled", False):
+            return J
+
+        dv_names = opt.optimization_options["problem_options"]["dvs"]
+        active = [(n, dv_names.index(n)) for n in names if n in dv_names and dv_names.index(n) < x.shape[0]]
+        if not active:
+            return J
+
+        gpmodel = getattr(combined_gp, "gpmodel", combined_gp)
+        models = list(getattr(gpmodel, "models", []))
+        tfs = [m.input_transform.tf1 for m in models if hasattr(m, "input_transform")]
+        if not tfs:
+            return J
+
+        x0 = x.detach()
+        X0 = x0.unsqueeze(0)
+
+        # Per-submodel baseline feature dimensions (phi = tf1 output).
+        with torch.no_grad():
+            dims = [int(tf(X0).shape[-1]) for tf in tfs]
+        n_feat = int(sum(dims))
+        if n_feat == 0:
+            return J
+
+        # --- A = dR/dphi via eps-injection hooks on each tf1 output ---
+        eps_holder = [None] * len(tfs)
+
+        def _make_hook(i):
+            def hook(module, inp, out):
+                e = eps_holder[i]
+                return out if e is None else out + e.to(out)
+            return hook
+
+        handles = [tf.register_forward_hook(_make_hook(i)) for i, tf in enumerate(tfs)]
+        try:
+            def R_of_eps(eps_flat):
+                off = 0
+                for i, d in enumerate(dims):
+                    eps_holder[i] = eps_flat[off:off + d]  # 1D, broadcasts over trailing feature dim
+                    off += d
+                y_mean, _, _, _ = combined_gp.predict(X0)
+                of, cal, _ = self.scalarized_objective(y_mean)
+                return (cal - of).squeeze(0)
+
+            eps0 = torch.zeros(n_feat).to(x0)
+            _, A = multivariate_tools.mitim_jacobian(R_of_eps, eps0, vectorize=True)  # (n_res, n_feat)
+        finally:
+            for h in handles:
+                h.remove()
+            for i in range(len(eps_holder)):
+                eps_holder[i] = None
+
+        A = A.detach()
+
+        # --- B = dphi/d(aLy_lcfs) via parameterizer-only central FD on tf1(x) ---
+        try:
+            bw = np.array(list(self.bounds.values()))
+            width = np.maximum(bw[:, 1] - bw[:, 0], 1e-12)
+        except Exception:
+            width = None
+
+        def _phi(xv):
+            with torch.no_grad():
+                return torch.cat([tf(xv.unsqueeze(0)).reshape(-1) for tf in tfs])
+
+        J = J.clone()
+        for name, j in active:
+            eps = 1e-3 * float(width[j]) if width is not None else max(1e-3 * abs(float(x0[j].item())), 1e-5)
+            xp = x0.clone(); xp[j] = xp[j] + eps
+            xm = x0.clone(); xm[j] = xm[j] - eps
+            B_j = (_phi(xp) - _phi(xm)) / (2.0 * eps)  # (n_feat,)
+            J[:, j] = A @ B_j.to(A)
+
+        return J
+
+    def _verify_lcfs_flux_columns(self, residual_fn, x, f0, J):
+        """Cross-check the LCFS columns of ``J`` against the legacy full-GP FD.
+
+        Transitional check: ``J`` now carries the chain-rule-split LCFS columns
+        (``_lcfs_columns_via_chain``). This recomputes the same columns with the
+        old finite-difference of the flux residual through the whole GP and
+        reports the relative discrepancy per LCFS DV. They should agree (both
+        include the re-fit); a large gap flags a wiring error in the split (e.g.
+        a mismatched feature boundary or missing GB outcome factor).
+        """
+        opt = getattr(self, "optimization_object", None)
+        ps = getattr(opt, "powerstate", None)
+        names = getattr(opt, "_lcfs_dv_names", None)
+        if opt is None or ps is None or not names or not getattr(ps, "_lcfs_dv_enabled", False):
+            return
+        dv_names = opt.optimization_options["problem_options"]["dvs"]
+        J_fd = self._fd_lcfs_flux_columns(residual_fn, x, f0, J.clone())
+        for name in names:
+            if name not in dv_names:
+                continue
+            j = dv_names.index(name)
+            if j >= J.shape[1]:
+                continue
+            ad_col, fd_col = J[:, j].detach(), J_fd[:, j].detach()
+            denom = fd_col.abs().max().clamp(min=1e-12)
+            rel = (ad_col - fd_col).abs().max() / denom
+            ad_nz = ad_col.abs().max().item()
+            msg = (f"[LCFS verify] {name}: max|AD-FD|/max|FD| = {rel.item():.2e} "
+                   f"(|AD|max={ad_nz:.2e}, |FD|max={fd_col.abs().max().item():.2e})")
+            print(msg, typeMsg="w" if (rel.item() > 5e-2 or ad_nz < 1e-12) else "i")
+
+    def _fd_lcfs_flux_columns(self, residual_fn, x, f0, J):
+        """
+        Overwrite the flux-residual Jacobian columns of the LCFS aLy DVs with
+        central finite differences of the GP flux residual ``residual_fn``.
+
+        The LCFS DVs are not GP inputs, so the autograd Jacobian is zero for their
+        columns; but perturbing one re-runs the GP input transform (profile
+        reconstruction with the new aLy(1) BC), so a finite difference captures
+        how that DV moves the overall flux objective. Interior columns are left
+        as the GP/autograd Jacobian. 2 cheap GP evaluations per LCFS DV.
+        """
+        opt = getattr(self, "optimization_object", None)
+        ps = getattr(opt, "powerstate", None)
+        names = getattr(opt, "_lcfs_dv_names", None)
+        if opt is None or ps is None or not names or not getattr(ps, "_lcfs_dv_enabled", False):
+            return J
+
+        dv_names = opt.optimization_options["problem_options"]["dvs"]
+        try:
+            bw = np.array(list(self.bounds.values()))
+            width = np.maximum(bw[:, 1] - bw[:, 0], 1e-12)
+        except Exception:
+            width = None
+
+        x = x.detach()
+        J = J.clone()
+        for name in names:
+            if name not in dv_names:
+                continue
+            j = dv_names.index(name)
+            if j >= x.shape[0]:
+                continue
+            eps = 1e-3 * float(width[j]) if width is not None else max(1e-3 * abs(float(x[j].item())), 1e-5)
+            xp = x.clone(); xp[j] = xp[j] + eps
+            xm = x.clone(); xm[j] = xm[j] - eps
+            fp = residual_fn(xp).detach()
+            fm = residual_fn(xm).detach()
+            J[:, j] = (fp - fm) / (2.0 * eps)
+
+        return J
+
+    def _append_lcfs_prior_rows(self, x, mu_F, Sigma_F_diag, J):
+        """
+        Append the section-6 LCFS soft-prior residual rows to the weighted-LM
+        system. Each LCFS aLy DV ``y`` contributes one row::
+
+            mu_row    = y - F_y                  (residual)
+            Sigma_row = (sigma_rel * |F_y|)^2    (prior trust, soft)
+            J_row     = e_idx                    (unit; y is a DV column of x)
+
+        so the weighted term is exactly (y - F_y)^2 / sigma_y^2 -- the Gaussian
+        soft prior toward the BC-model prediction. F_y / sigma come from the
+        powerstate; the rows are skipped (no-op) for non-edge optimization
+        objects, keeping wLM generic.
+        """
+        opt = getattr(self, "optimization_object", None)
+        ps = getattr(opt, "powerstate", None)
+        names = getattr(opt, "_lcfs_dv_names", None)
+        if opt is None or ps is None or not names:
+            return mu_F, Sigma_F_diag, J
+        if not getattr(ps, "_lcfs_dv_enabled", False):
+            return mu_F, Sigma_F_diag, J
+
+        dv_names = opt.optimization_options["problem_options"]["dvs"]
+        prior = getattr(ps, "lcfs_prior", {}) or {}
+        sigma = getattr(ps, "lcfs_sigma", {}) or {}
+        n_dv = J.shape[1]
+
+        rows_mu, rows_sig, rows_J = [], [], []
+        for name in names:
+            if name not in dv_names:
+                continue
+            ch = name[len("aL"):-len("_lcfs")]
+            if ch not in prior or prior[ch].numel() == 0:
+                continue
+            idx = dv_names.index(name)
+            if idx >= n_dv:
+                continue
+            Fy = float(prior[ch].reshape(-1)[0].item())
+            sig_abs = max(float(sigma.get(ch, 0.15)) * abs(Fy), 1e-6)
+            rows_mu.append(float(x[idx].item()) - Fy)
+            rows_sig.append(sig_abs ** 2)
+            e = torch.zeros(n_dv, dtype=J.dtype, device=J.device)
+            e[idx] = 1.0
+            rows_J.append(e)
+
+        if not rows_mu:
+            return mu_F, Sigma_F_diag, J
+
+        mu_extra = torch.tensor(rows_mu, dtype=mu_F.dtype, device=mu_F.device)
+        sig_extra = torch.tensor(rows_sig, dtype=Sigma_F_diag.dtype, device=Sigma_F_diag.device).clamp(min=1e-12)
+        J_extra = torch.stack(rows_J, dim=0)
+
+        return (
+            torch.cat([mu_F, mu_extra], dim=0),
+            torch.cat([Sigma_F_diag, sig_extra], dim=0),
+            torch.cat([J, J_extra], dim=0),
+        )
 
     # ------------------------------------------------------------------
     # Constrained QP step: box bounds + soft monotonicity (active-set, OSQP)
@@ -2112,7 +2367,10 @@ class MITIM_wLM(MITIM_BO):
         doc's "carry the active set from the previous iteration" intent.
         """
         import scipy.sparse as sp
-        import osqp
+        try:
+            import osqp
+        except ImportError:
+            osqp = None
 
         n = x.shape[0]
         pairs = self._mono_pairs
@@ -2171,47 +2429,102 @@ class MITIM_wLM(MITIM_BO):
         l_vec = np.concatenate(l_list)
         u_vec = np.concatenate(u_list)
 
-        prob = osqp.OSQP()
-        prob.setup(P, q, A_constr, l_vec, u_vec, verbose=False, warm_start=True, polish=True)
+        if osqp is not None:
+            prob = osqp.OSQP()
+            prob.setup(P, q, A_constr, l_vec, u_vec, verbose=False, warm_start=True, polish=True)
 
-        if (self._qp_warm_start is not None) and (self._qp_warm_start[0].shape[0] == n + m):
-            prob.warm_start(x=self._qp_warm_start[0], y=self._qp_warm_start[1])
+            if (self._qp_warm_start is not None) and (self._qp_warm_start[0].shape[0] == n + m):
+                prob.warm_start(x=self._qp_warm_start[0], y=self._qp_warm_start[1])
 
-        res = prob.solve()
+            res = prob.solve()
+            status_ok = res.info.status in ("solved", "solved inaccurate")
+            z_sol = res.x if status_ok else None
+            y_sol = res.y if status_ok else None
+            status_msg = res.info.status
+        else:
+            # OSQP not installed: solve the same QP with SciPy's trust-constr,
+            # which is always available and handles linear constraints with inf
+            # bounds. min 0.5 z^T P z + q^T z  s.t.  l <= A z <= u.
+            z_sol, y_sol, status_ok, status_msg = self._solve_qp_scipy(
+                P, q, A_constr, l_vec, u_vec, n + m
+            )
 
-        if res.info.status not in ("solved", "solved inaccurate"):
+        if not status_ok:
             print(
-                f"\t\t* QP step solve failed (status: '{res.info.status}'); "
+                f"\t\t* QP step solve failed (status: '{status_msg}'); "
                 f"falling back to the damped Gauss-Newton step (no constraint refinement)",
                 typeMsg="w",
             )
             delta_np = np.linalg.solve(A_mat + 1e-8 * np.eye(n), -b_vec)
+            # Respect the hard box bounds even on the unconstrained fallback.
+            delta_np = np.clip(delta_np, lb_np - x_np, ub_np - x_np)
             self._qp_warm_start = None
         else:
-            delta_np = res.x[:n]
-            self._qp_warm_start = (res.x, res.y)
-            if m > 0:
+            delta_np = z_sol[:n]
+            self._qp_warm_start = (z_sol, y_sol) if y_sol is not None else None
+            if m > 0 and y_sol is not None and len(y_sol) >= n + m:
                 self._active_mono_duals = {
-                    pairs[k]: float(res.y[n + k])
+                    pairs[k]: float(y_sol[n + k])
                     for k in range(m)
-                    if abs(res.y[n + k]) > self.wlm_options["active_dual_tol"]
+                    if abs(y_sol[n + k]) > self.wlm_options["active_dual_tol"]
                 }
 
         return torch.tensor(delta_np, dtype=x.dtype, device=x.device)
 
+    def _solve_qp_scipy(self, P, q, A_constr, l_vec, u_vec, nz):
+        """
+        OSQP-free fallback for the weighted-LM QP step using SciPy trust-constr.
+
+        Solves  min 0.5 z^T P z + q^T z  s.t.  l <= A z <= u  (z = [delta; s]),
+        the same convex QP as the OSQP path. Returns
+        (z, dual_estimate_or_None, status_ok, status_msg). trust-constr handles
+        the inf upper bounds on the monotonicity / slack rows natively.
+        """
+        from scipy.optimize import minimize, LinearConstraint
+
+        P_d = P.toarray() if hasattr(P, "toarray") else np.asarray(P, dtype=float)
+        A_d = A_constr.toarray() if hasattr(A_constr, "toarray") else np.asarray(A_constr, dtype=float)
+        q_d = np.asarray(q, dtype=float)
+
+        def fun(z):
+            return 0.5 * z @ P_d @ z + q_d @ z
+
+        def grad(z):
+            return P_d @ z + q_d
+
+        def hess(z):
+            return P_d
+
+        z0 = np.zeros(nz)
+        if (self._qp_warm_start is not None) and (self._qp_warm_start[0].shape[0] == nz):
+            z0 = np.asarray(self._qp_warm_start[0], dtype=float)
+
+        try:
+            res = minimize(
+                fun, z0, method="trust-constr", jac=grad, hess=hess,
+                constraints=[LinearConstraint(A_d, l_vec, u_vec)],
+                options={"maxiter": 200, "gtol": 1e-9, "xtol": 1e-10, "verbose": 0},
+            )
+        except Exception as exc:
+            return None, None, False, f"scipy-exception: {exc}"
+
+        # trust-constr exposes constraint Lagrange multipliers in res.v (list,
+        # one array per constraint); use them as the dual estimate when present.
+        dual = None
+        v = getattr(res, "v", None)
+        if v is not None and len(v) > 0 and np.asarray(v[0]).shape[0] == A_d.shape[0]:
+            dual = np.asarray(v[0], dtype=float)
+
+        status_ok = bool(getattr(res, "success", False)) or res.status in (1, 2)
+        return res.x, dual, status_ok, f"trust-constr status {res.status}"
+
     # ------------------------------------------------------------------
     # Shared context (bounds / training-data tensors) and the inner
-    # weighted-LM solve loop -- factored out of _step so that Phase 3
-    # can re-run the *exact same* solver (warm-started from x_int_star)
-    # to find the optimal x_int at a perturbed x_lcfs (see
-    # _assess_lcfs_feasibility): "would re-optimizing x_int for a nearby
-    # x_lcfs converge to something better?" requires an inner solve, not
-    # a fixed-point evaluation.
+    # weighted-LM solve loop.
     # ------------------------------------------------------------------
 
     def _lm_context(self):
-        """Bounds/training-data tensors shared by every _run_inner_lm call
-        (both the main _step solve and Phase 3's re-optimization sub-solves)."""
+        """Bounds/training-data tensors shared by every _run_inner_lm call."""
         bounds_arr = np.array(list(self.bounds.values()))   # (n_DV, 2)
         lb = torch.tensor(bounds_arr[:, 0]).to(self.dfT)
         ub = torch.tensor(bounds_arr[:, 1]).to(self.dfT)
@@ -2239,14 +2552,8 @@ class MITIM_wLM(MITIM_BO):
         trust region (mirrors _step: the loop never wanders far from where
         it started).
 
-        Two callers:
-          - _step: starts from the best evaluated point, full max_inner_iter
-            budget -- this *is* Phase 2 of the design doc.
-          - _assess_lcfs_feasibility (Phase 3): starts from x_int_star,
-            warm-started, with a small max_iter cap -- finds x_int*(x_lcfs)
-            for a perturbed boundary condition. Since the perturbation is
-            small and x_int_star is already near-optimal for the nominal
-            x_lcfs, this should converge in just a few iterations.
+        Called by _step: starts from the best evaluated point with the full
+        max_inner_iter budget.
 
         Returns (x_converged, info) with
             info = {"n_iter", "stop_reason", "grad_mag"}
@@ -2456,751 +2763,6 @@ class MITIM_wLM(MITIM_BO):
             f"{x_k.cpu().numpy()}"
         )
 
-    # ------------------------------------------------------------------
-    # Real-model confirmation (the surrogate is only ever a proxy)
-    # ------------------------------------------------------------------
-
-    def _run_lcfs_jitter_and_retrain(self, x_int_star, n_jitter):
-        """
-        Run n_jitter real transport evaluations with x_lcfs drawn uniformly
-        from the Phase-3 bracket, append the results to the training set, and
-        refit the GP.  Returns the updated combined_model for use by
-        _assess_lcfs_feasibility.
-
-        x_int is lightly jittered around x_int_star for each draw so the GP
-        sees n_jitter distinct input points rather than n_jitter identical
-        copies of x_int_star (identical inputs with varied outputs appear as
-        noise to the GP and raise inferred likelihood variance instead of
-        reducing posterior uncertainty).
-
-        This is done in MITIM_wLM.run() -- after BO convergence, before Phase
-        3 -- so the GP is already well-trained on x_int space.  x_lcfs
-        variation at initialization time looks like unexplained noise (x_lcfs
-        is not a GP feature), degrades early BO convergence, and was the
-        reason initialization_sr_w_lcfs_jitter was removed.
-        """
-        Sigma_lcfs = self.wlm_options["Sigma_lcfs"]
-        y_or_aly = self.wlm_options["y_or_aly"]
-        sigma_is_rel = self.wlm_options["sigma_is_rel"]
-        n_sigma = float(self.wlm_options["lcfs_n_sigma"])
-
-        powerstate = self.optimization_object.powerstate
-        if not (hasattr(powerstate, "bc_dict") and isinstance(powerstate.bc_dict, dict) and len(powerstate.bc_dict) > 0):
-            print("\t* Phase 3 jitter: powerstate has no bc_dict -- skipping", typeMsg="w")
-            return self.steps[-1].GP["combined_model"]
-
-        families_by_mode = {"y": ["y"], "aly": ["aly"], "both": ["y", "aly"]}
-        families = families_by_mode.get(y_or_aly, ["y"])
-
-        def _sigma_val(sigma_spec, family):
-            # Per-family sigma from a Sigma_lcfs[channel] spec. The gradient
-            # family is tokenised "aly" internally but users commonly key the
-            # dict "aLy" (matching the bc_dict "aL{channel}" convention), so
-            # accept both spellings -- otherwise the gradient sigma silently
-            # resolves to 0 and its draws become no-ops.
-            if isinstance(sigma_spec, dict):
-                keys = ("y",) if family == "y" else ("aly", "aLy", "aLY", "aL")
-                for k in keys:
-                    if k in sigma_spec:
-                        return float(sigma_spec[k])
-                return float(sigma_spec.get("both", 0.0))
-            if isinstance(sigma_spec, (list, tuple)) and len(sigma_spec) == 2:
-                return float(sigma_spec[0] if family == "y" else sigma_spec[1])
-            return float(sigma_spec)
-
-        survey_targets = []   # (bc_key, sigma_abs, nominal_val, roa_loc)
-        for channel, sigma_spec in Sigma_lcfs.items():
-            for family in families:
-                bc_key = channel if family == "y" else f"aL{channel}"
-                if bc_key not in powerstate.bc_dict:
-                    continue
-                nominal_val, roa_loc = powerstate.bc_dict[bc_key]
-                sv = _sigma_val(sigma_spec, family)
-                sigma_abs = sv * abs(float(nominal_val)) if sigma_is_rel else float(sv)
-                survey_targets.append((bc_key, sigma_abs, float(nominal_val), roa_loc))
-
-        if not survey_targets:
-            print("\t* Phase 3 jitter: no bc_dict targets resolved -- skipping", typeMsg="w")
-            return self.steps[-1].GP["combined_model"]
-
-        bounds_arr = np.array(list(self.bounds.values()))   # (n_DV, 2)
-        lb_np, ub_np = bounds_arr[:, 0], bounds_arr[:, 1]
-        x_star_np = x_int_star.detach().cpu().numpy().flatten()
-        bounds_width = ub_np - lb_np
-
-        rng = np.random.default_rng(getattr(self, "seed", 0) or 0)
-
-        print(f"\n\t--- Phase 3 pre-step: {n_jitter} real evaluation(s) across x_lcfs bracket + GP retraining ---")
-
-        new_X, new_Y, new_Ystd = [], [], []
-        for j in range(n_jitter):
-            # Draw x_lcfs uniformly from the bracket for each target
-            bc_overrides = {}
-            for bc_key, sigma_abs, nominal_val, roa_loc in survey_targets:
-                draw = nominal_val + rng.uniform(-n_sigma * sigma_abs, n_sigma * sigma_abs)
-                bc_overrides[bc_key] = (draw, roa_loc)
-
-            # Light x_int jitter (1% of bounds width) so GP inputs are distinct
-            x_j = np.clip(
-                x_star_np + rng.normal(size=x_star_np.shape) * 0.01 * bounds_width,
-                lb_np, ub_np,
-            )
-
-            for bc_key, (val, loc) in bc_overrides.items():
-                powerstate.bc_dict[bc_key] = [val, loc]
-            try:
-                _, y_j, ystd_j = self._evaluate_real(
-                    x_j,
-                    label=f"Phase3 jitter {j + 1}/{n_jitter}",
-                    sync_csv=False,
-                )
-            finally:
-                for bc_key, _, nominal_val, roa_loc in survey_targets:
-                    powerstate.bc_dict[bc_key] = [nominal_val, roa_loc]
-
-            new_X.append(x_j)
-            new_Y.append(np.atleast_2d(y_j).flatten())
-            new_Ystd.append(np.atleast_2d(ystd_j).flatten())
-
-        # Append to training arrays and sync optimization_data
-        self.train_X = np.append(self.train_X, np.array(new_X), axis=0)
-        self.train_Y = np.append(self.train_Y, np.array(new_Y), axis=0)
-        self.train_Ystd = np.append(self.train_Ystd, np.array(new_Ystd), axis=0)
-
-        _, _, objective = self.optimization_object.scalarized_objective(
-            torch.from_numpy(self.train_Y).to(self.dfT)
-        )
-        self.optimization_data.update_points(
-            self.train_X, Y=self.train_Y, Ystd=self.train_Ystd,
-            objective=objective.cpu().numpy(),
-        )
-
-        # Refit GP on the enlarged dataset (not appended to self.steps to avoid
-        # disturbing the BO loop's step bookkeeping; the refitted GP is used
-        # only by _assess_lcfs_feasibility and then discarded).
-        train_Ystd_fit = (
-            self.train_Ystd
-            if self.optimization_options["evaluation_options"]["train_Ystd"] is None
-            else self.optimization_options["evaluation_options"]["train_Ystd"]
-        )
-        refit_step = STEPtools.OPTstep(
-            self.train_X,
-            self.train_Y,
-            train_Ystd_fit,
-            bounds=self.bounds,
-            stepSettings=self.stepSettings,
-            currentIteration=self.currentIteration,
-            strategy_options=self.strategy_options_use,
-            BOmetrics=self.BOmetrics,
-            surrogate_parameters=self.surrogate_parameters,
-        )
-        avoidPoints = np.unique([int(k) for k in np.append(self.avoidPoints_failed, self.avoidPoints_outside)])
-        refit_step.fit_step(avoidPoints=avoidPoints)
-
-        print("\t* Phase 3 jitter: GP refitted with bracket-survey data")
-        return refit_step.GP["combined_model"]
-
-    def _evaluate_real(self, x, label="", sync_csv=True):
-        """
-        Run the *real* transport model at an explicit point x -- not
-        self.x_next, so this cannot disturb the outer run() loop's
-        bookkeeping -- via EVALUATORtools.fun, the exact pathway
-        MITIM_BO._evaluate uses to populate the GP training set (same
-        Execution/ folder + numEval bookkeeping, so these calls are
-        indistinguishable from ordinary real evaluations on disk).
-
-        Used by Phase 3 to confirm surrogate-based conclusions: a claim as
-        consequential as "re-optimizing at a nearby x_lcfs converges to a
-        better operating point" should not be reported on surrogate
-        evidence alone.
-
-        sync_csv=False skips the update_data_point call inside EVALUATORtools
-        (by passing optimization_data=None).  Use this when the caller manages
-        CSV writes itself (e.g. _run_lcfs_jitter_and_retrain, which batch-syncs
-        via update_points after the loop) or when the evaluation is diagnostic
-        and should not enter the training CSV (e.g. _assess_lcfs_feasibility
-        validation runs).  Also prevents a stale cold_start=False cache hit when
-        bc_dict has been modified for the evaluation.
-
-        Returns (phi, y, ystd); phi follows the scalarized_objective
-        "value to maximize" convention used throughout this class.
-        """
-        x_np = np.atleast_2d(x.detach().cpu().numpy() if torch.is_tensor(x) else x)
-
-        y, ystd, self.numEval = EVALUATORtools.fun(
-            self.optimization_object,
-            x_np,
-            self.folderExecution,
-            self.bounds,
-            self.outputs,
-            self.optimization_data if sync_csv else None,
-            parallel=self.parallel_evaluations,
-            cold_start=True,  # Always fresh: called at perturbed x_lcfs, not valid CSV cache
-            numEval=self.numEval,
-        )
-
-        _, _, phi = self.scalarized_objective(torch.as_tensor(y).to(self.dfT))
-        phi_val = phi.squeeze().item()
-
-        if label:
-            print(f"\t\t  [real-model check: {label}]  phi_real = {phi_val:+.4e}")
-
-        return phi_val, y, ystd
-
-    # ------------------------------------------------------------------
-    # Phase 3 refinement: iterative real-model + inner-wLM at best x_lcfs
-    # ------------------------------------------------------------------
-
-    def _refine_lcfs_candidate(self, best_sample, nominal_bc, phi_nominal_real, combined_gp):
-        """
-        Refine the best LCFS BC candidate via iterative real evaluation + GP
-        retraining + inner wLM re-optimization (phase 2 style, but anchored to
-        the converged x_lcfs).
-
-        If lcfs_refine_n_evals == 0: single confirmation check (minimal validation).
-        If lcfs_refine_n_evals > 0: run that many real evaluations with warm-started
-        inner wLM optimization in between, retraining the GP after each new point.
-
-        Warm-starts from the best_sample's x_int and x_lcfs (phase 3 best BC).
-        Returns a refined version of best_sample with accumulated real-model results.
-        """
-        n_refine_evals = max(0, int(self.wlm_options.get("lcfs_refine_n_evals", 0)))
-
-        powerstate = self.optimization_object.powerstate
-        ctx = self._lm_context()
-
-        x_int_current = torch.tensor(
-            best_sample["x_int_star"], dtype=self.dfT.dtype, device=self.dfT.device
-        )
-
-        print(
-            f"\n\t--- Phase 3 refinement: best x_lcfs candidate "
-            f"({n_refine_evals} real eval(s) + inner wLM) ---"
-        )
-
-        refine_history = []
-        for refine_iter in range(n_refine_evals + 1):
-            label_iter = f"Refine {refine_iter + 1}/{n_refine_evals + 1}"
-
-            # Real evaluation at current x_int and best x_lcfs
-            # Pass optimization_data directly so EVALUATORtools syncs the CSV
-            for bc_key, val in best_sample["x_lcfs"].items():
-                powerstate.bc_dict[bc_key] = [val, nominal_bc[bc_key][1]]
-            try:
-                x_np = np.atleast_2d(x_int_current.detach().cpu().numpy())
-                y_real, ystd_real, self.numEval = EVALUATORtools.fun(
-                    self.optimization_object,
-                    x_np,
-                    self.folderExecution,
-                    self.bounds,
-                    self.outputs,
-                    self.optimization_data,  # Sync directly to CSV
-                    parallel=self.parallel_evaluations,
-                    cold_start=True,  # Always fresh: perturbed x_lcfs ≠ any prior CSV entry
-                    numEval=self.numEval,
-                )
-                _, _, phi_real_t = self.scalarized_objective(torch.as_tensor(y_real).to(self.dfT))
-                phi_real = phi_real_t.squeeze().item()
-
-                print(f"\t\t  [Phase3 refine {label_iter}]  phi_real = {phi_real:+.4e}")
-            finally:
-                for bc_key in best_sample["x_lcfs"]:
-                    powerstate.bc_dict[bc_key] = list(nominal_bc[bc_key])
-
-            refine_history.append({
-                "eval_iter": refine_iter + 1,
-                "phi_real": phi_real,
-                "x_int": x_int_current.detach().cpu().numpy().copy(),
-                "y_real": y_real.copy() if hasattr(y_real, "copy") else np.array(y_real),
-                "ystd_real": ystd_real.copy() if hasattr(ystd_real, "copy") else np.array(ystd_real),
-            })
-
-            # If this was the final evaluation, don't optimize further
-            if refine_iter >= n_refine_evals:
-                break
-
-            # Append the new point to training data and retrain GP
-            self.train_X = np.append(
-                self.train_X, x_int_current.detach().cpu().numpy().reshape(1, -1), axis=0
-            )
-            y_real_flat = np.atleast_2d(y_real).flatten()
-            ystd_real_flat = np.atleast_2d(ystd_real).flatten()
-            self.train_Y = np.append(self.train_Y, y_real_flat.reshape(1, -1), axis=0)
-            self.train_Ystd = np.append(self.train_Ystd, ystd_real_flat.reshape(1, -1), axis=0)
-
-            # Refit GP
-            train_Ystd_fit = (
-                self.train_Ystd
-                if self.optimization_options["evaluation_options"]["train_Ystd"] is None
-                else self.optimization_options["evaluation_options"]["train_Ystd"]
-            )
-            refit_step = STEPtools.OPTstep(
-                self.train_X,
-                self.train_Y,
-                train_Ystd_fit,
-                bounds=self.bounds,
-                stepSettings=self.stepSettings,
-                currentIteration=self.currentIteration,
-                strategy_options=self.strategy_options_use,
-                BOmetrics=self.BOmetrics,
-                surrogate_parameters=self.surrogate_parameters,
-            )
-            avoidPoints = np.unique(
-                [int(k) for k in np.append(self.avoidPoints_failed, self.avoidPoints_outside)]
-            )
-            refit_step.fit_step(avoidPoints=avoidPoints)
-            combined_gp = refit_step.GP["combined_model"]
-
-            print(f"\t\t* Phase 3 refinement: GP refitted after eval #{refine_iter + 1}")
-
-            # Run inner wLM to optimize x_int at the best x_lcfs
-            max_iter_refine = max(
-                1, int(self.wlm_options.get("lcfs_reopt_refine_max_iter", 3))
-            )
-            x_int_current, info = self._run_inner_lm(
-                x_int_current, combined_gp, ctx,
-                max_iter=max_iter_refine,
-                label=f"Phase3-Refine[{refine_iter + 2}/{n_refine_evals + 1}]",
-                verbose=True,
-            )
-
-        # Assemble final refined sample
-        best_sample["refine_history"] = refine_history
-        best_sample["x_int_final"] = x_int_current.detach().cpu().numpy()
-        best_sample["phi_real_final"] = refine_history[-1]["phi_real"]
-        best_sample["delta_phi_real_final"] = (
-            refine_history[-1]["phi_real"] - phi_nominal_real
-        )
-        best_sample["n_refine_evals"] = n_refine_evals
-
-        return best_sample
-
-    # ------------------------------------------------------------------
-    # Apply optimized x_lcfs from phase 3 refinement (for post-analysis)
-    # ------------------------------------------------------------------
-
-    def apply_best_x_lcfs_optimized(self):
-        """
-        Apply the optimized x_lcfs boundary conditions from phase 3 refinement
-        to the powerstate. Call this before post-analysis / plotting to ensure
-        the final results reflect the optimized (not modeled) boundary conditions.
-
-        WARNING: This must be called BEFORE any powerstate.calculate() or
-        calculateBoundaryConditions() that would overwrite bc_dict, otherwise
-        the optimized values will be lost.
-
-        Returns True if optimized values were applied, False if none available.
-        """
-        if not hasattr(self, "best_x_lcfs_optimized") or not self.best_x_lcfs_optimized:
-            print("\t* No optimized x_lcfs available (phase 3 refinement may not have run)", typeMsg="i")
-            return False
-
-        powerstate = self.optimization_object.powerstate
-        if not hasattr(powerstate, "bc_dict"):
-            print("\t* powerstate has no bc_dict -- cannot apply optimized x_lcfs", typeMsg="w")
-            return False
-
-        print("\n\t--- Applying optimized x_lcfs from phase 3 refinement ---")
-        for bc_key, val in self.best_x_lcfs_optimized.items():
-            if bc_key in powerstate.bc_dict:
-                nominal_val, roa_loc = powerstate.bc_dict[bc_key]
-                powerstate.bc_dict[bc_key] = [val, roa_loc]
-                print(f"\t\t{bc_key}: {nominal_val:+.4e} -> {val:+.4e}")
-            else:
-                print(f"\t\t{bc_key}: NOT found in bc_dict (skipping)", typeMsg="w")
-
-        return True
-
-    # ------------------------------------------------------------------
-    # Phase 3: x_lcfs feasibility assessment (nested re-optimization)
-    # ------------------------------------------------------------------
-
-    def _assess_lcfs_feasibility(self, x_int_star, combined_gp):
-        """
-        After convergence at x_lcfs_nominal with x_int_star, ask: can the
-        objective be reduced *further* by varying the LCFS boundary
-        conditions within their modeled uncertainty Sigma_lcfs? The edge
-        model supplies x_lcfs as uncertain parameters (deterministic priors,
-        not design variables), so the converged objective is only as good as
-        the assumed x_lcfs -- this quantifies how objective-consequential
-        that boundary uncertainty is.
-
-        Mechanism -- joint Monte Carlo + nested re-optimization:
-        draw lcfs_n_samples *full* x_lcfs vectors from the joint prior
-        (diagonal Sigma_lcfs: independent truncated normals per boundary
-        parameter, N(nominal, sigma_abs^2) clipped to +/- lcfs_n_sigma*sigma_abs
-        to stay inside the modeled prior and limit GP extrapolation through
-        the bc -> profile -> feature path). For each draw, perturb every
-        powerstate.bc_dict[bc_key] at once and re-run the *same* weighted-LM
-        inner loop (_run_inner_lm, capped at lcfs_reopt_max_iter, warm-started
-        from x_int_star) to find x_int*(x_lcfs_draw). All boundary parameters
-        move together per draw (the uncertainty is on the boundary vector as a
-        whole), and x_int is re-tuned against each draw -- this is the joint
-        (x_int, x_lcfs) sweep a one-at-a-time or fixed-x_int* sensitivity cannot
-        capture. Re-running the proven inner loop (rather than novel
-        d(mu_F)/d(x_lcfs) derivative machinery) reuses 100% tested code;
-        warm-starting + capping keeps each sub-solve cheap.
-
-        `y_or_aly` selects which bc_dict famil(ies) are perturbed per channel:
-        "y" -> plain value keys "te"/"ti"/"ne"/"ni", "aly" -> gradient keys
-        "aLte"/"aLti"/"aLne"/"aLni", or "both" -> perturb each channel's "y"
-        *and* "aly" keys (each with its own sigma, drawn jointly).
-        Sigma_lcfs is keyed by the plain channel name regardless, since
-        bc_dict carries both families simultaneously; in "both" mode
-        Sigma_lcfs[channel] may be a 2-sequence (sigma_y, sigma_aly) or a
-        {"y":.., "aLy":..} dict to give each family its own sigma (the two
-        live on different scales -- e.g. keV vs a dimensionless
-        gradient-scale-length ratio -- so a shared absolute number is not
-        generally meaningful for both; a bare scalar is broadcast to both
-        only when sigma_is_rel=True, since a relative fraction is scale-free).
-        The gradient-family key is accepted as "aLy"/"aly" interchangeably.
-        `sigma_is_rel` lets each resolved sigma be a fraction of that
-        family's own nominal BC value (sigma_abs = sigma_rel * |nominal_val|)
-        rather than an absolute std-dev the user would otherwise pre-compute.
-
-        Outcome -- NOT a feasibility verdict. phi is "a value to maximize"
-        (= -residual), so delta_phi = phi(x_int*(x_lcfs_draw)) - phi_nominal
-        > 0 means a draw lowered the objective. The report gives the fraction
-        of draws that improve, the best draw's reduction and the x_lcfs shift
-        driving it, and -- crucially -- whether the best reduction clears the
-        surrogate's own noise floor (sigma_rel*|phi_nominal|) so small,
-        noise-level "improvements" are not over-claimed. No absolute
-        acceptable-residual / convergence threshold is applied.
-
-        Real-model confirmation: the surrogate triages lcfs_n_samples draws
-        cheaply, but the top `lcfs_validate_n_best` most-improving draws are
-        *always* re-evaluated with the real transport model (_evaluate_real,
-        the same EVALUATORtools.fun pathway MITIM_BO._evaluate uses) before
-        the verdict is finalised -- the surrogate is only ever a proxy.
-
-        Switchable: returns None (no-op) unless
-        wlm_options["lcfs_feasibility_enabled"] and a non-empty
-        wlm_options["Sigma_lcfs"] are provided. Runs once, at the final
-        converged point, via the run() override.
-        """
-        if not self.wlm_options["lcfs_feasibility_enabled"]:
-            return None
-
-        Sigma_lcfs = self.wlm_options["Sigma_lcfs"]
-        if not Sigma_lcfs:
-            print("\t* Phase 3: no Sigma_lcfs provided -- skipping x_lcfs feasibility check", typeMsg="i")
-            return None
-
-        powerstate = self.optimization_object.powerstate
-        if not (hasattr(powerstate, "bc_dict") and isinstance(powerstate.bc_dict, dict) and len(powerstate.bc_dict) > 0):
-            print("\t* Phase 3: powerstate has no bc_dict (not an edge state) -- skipping", typeMsg="i")
-            return None
-
-        y_or_aly = self.wlm_options["y_or_aly"]
-        sigma_is_rel = self.wlm_options["sigma_is_rel"]
-        n_sigma = self.wlm_options["lcfs_n_sigma"]
-        max_reopt_iter = self.wlm_options["lcfs_reopt_max_iter"]
-        stds = self.wlm_options["stds"]
-        sigma_rel_tol = self.wlm_options["sigma_rel_tol"]
-
-        # Which bc_dict famil(ies) to probe per channel, and how to pull
-        # that family's sigma out of a Sigma_lcfs[channel] spec that may be
-        # a bare scalar (broadcast) or a (sigma_y, sigma_aly) / {"y":..,
-        # "aly":..} pair (only meaningful -- and only needed -- in "both"
-        # mode, where the two families generally live on different scales).
-        families_by_mode = {"y": ["y"], "aly": ["aly"], "both": ["y", "aly"]}
-        families = families_by_mode.get(y_or_aly, ["y"])
-
-        def _sigma_value_for_family(sigma_spec, family):
-            # See _run_lcfs_jitter_and_retrain._sigma_val: the gradient family
-            # is tokenised "aly" but is commonly keyed "aLy" in the user spec
-            # (bc_dict uses "aL{channel}"), so accept both -- a key mismatch
-            # here silently zeroes the gradient sigma and makes its draws no-ops.
-            if isinstance(sigma_spec, dict):
-                keys = ("y",) if family == "y" else ("aly", "aLy", "aLY", "aL")
-                for k in keys:
-                    if k in sigma_spec:
-                        return float(sigma_spec[k])
-                return float(sigma_spec.get("both", 0.0))
-            if isinstance(sigma_spec, (list, tuple)) and len(sigma_spec) == 2:
-                return float(sigma_spec[0] if family == "y" else sigma_spec[1])
-            return float(sigma_spec)
-
-        # Map plain channel name -> [(family, bc_key), ...] for this run
-        # (bc_dict carries both "te"/"ti"/"ne" and "aLte"/"aLti"/"aLne"
-        # simultaneously; normally only one family is varied, but "both"
-        # probes each independently).
-        bc_keys = {}
-        for channel in Sigma_lcfs:
-            entries = []
-            for family in families:
-                bc_key = channel if family == "y" else f"aL{channel}"
-                if bc_key in powerstate.bc_dict:
-                    entries.append((family, bc_key))
-            if entries:
-                bc_keys[channel] = entries
-
-        if not bc_keys:
-            print(
-                f"\t* Phase 3: none of the Sigma_lcfs channels {list(Sigma_lcfs.keys())} "
-                f"map to bc_dict keys (y_or_aly='{y_or_aly}') present in "
-                f"{list(powerstate.bc_dict.keys())} -- skipping",
-                typeMsg="w",
-            )
-            return None
-
-        nominal_bc = {
-            bc_key: list(powerstate.bc_dict[bc_key])
-            for entries in bc_keys.values() for _family, bc_key in entries
-        }
-
-        # Index of the converged nominal solution: the reference every MC draw
-        # is compared against. No feasibility threshold is read here -- Phase 3
-        # asks "can the objective be reduced further by varying x_lcfs within
-        # its uncertainty?", answered by the *change* in objective under
-        # re-optimization, not by an absolute acceptable-residual bound.
-        ind_best = self.BOmetrics["overall"]["indBest"]
-        n_samples = max(1, int(self.wlm_options.get("lcfs_n_samples", 128)))
-
-        ctx = self._lm_context()
-
-        def _phi_at(x):
-            x_eval = x.detach().clone().unsqueeze(0)
-            with torch.no_grad():
-                y_mean, y_upper, y_lower, _ = combined_gp.predict(x_eval)
-                _, _, phi = self.scalarized_objective(y_mean)
-            sigma_y = (y_upper - y_lower).squeeze(0).abs() / (2.0 * stds)
-            sigma_rel = sigma_y.norm().item() / (y_mean.squeeze(0).norm().item() + 1e-12)
-            return phi.squeeze().item(), sigma_rel
-
-        # Resolve the per-key perturbation targets once: every (channel,
-        # family) present in bc_dict gets its own absolute sigma. All targets
-        # are drawn *jointly* per MC sample -- the modeled uncertainty is on
-        # the boundary vector as a whole, and x_int is re-optimized against
-        # each full draw (not one parameter at a time).
-        targets = []  # (channel, family, bc_key, nominal_val, roa_loc, sigma_abs)
-        for channel, entries in bc_keys.items():
-            sigma_spec = Sigma_lcfs[channel]
-            for family, bc_key in entries:
-                sigma_val = _sigma_value_for_family(sigma_spec, family)
-                nominal_val, roa_loc = nominal_bc[bc_key]
-                sigma_abs = sigma_val * abs(nominal_val) if sigma_is_rel else sigma_val
-                targets.append((channel, family, bc_key, nominal_val, roa_loc, sigma_abs))
-
-        active = [t for t in targets if t[5] > 0.0]
-        if not active:
-            print(
-                "\t* Phase 3: every resolved Sigma_lcfs sigma is zero (check the "
-                "Sigma_lcfs spec / y_or_aly / key spelling, e.g. 'aLy' vs 'aly') -- "
-                "no x_lcfs variation to sample, skipping",
-                typeMsg="w",
-            )
-            return None
-
-        rng = np.random.default_rng(getattr(self, "seed", 0) or 0)
-
-        result = None
-        try:
-            # Re-optimize x_int with the current (post-jitter) GP at nominal x_lcfs.
-            # x_int_star was found by the pre-jitter GP; after jitter retraining the
-            # GP landscape may have shifted so x_int_star is no longer optimal.
-            # Using x_int_star directly as the baseline would make every MC draw
-            # (which re-optimizes x_int on the new GP) look artificially better.
-            # This gives a fair baseline and the correct warm-start for MC draws.
-            x_int_nominal, _info_nom = self._run_inner_lm(
-                x_int_star, combined_gp, ctx,
-                max_iter=max_reopt_iter,
-                label="Phase3-Nominal",
-                verbose=True,
-            )
-            phi_nominal, sigma_rel_nominal = _phi_at(x_int_nominal)
-
-            print("\n\t--- Phase 3: x_lcfs sensitivity (joint MC + nested re-optimization) ---")
-            print(
-                f"\t\t{n_samples} joint draws over {len(active)} boundary parameter(s) "
-                f"[{', '.join(t[2] for t in active)}]; truncated normal at +/-{n_sigma:.1f} sigma"
-            )
-            print(f"\t\tnominal (surrogate):  phi={phi_nominal:+.4e}  (sigma/|y|={sigma_rel_nominal:.3e})")
-
-            # --- Joint Monte Carlo: each draw perturbs the *full* x_lcfs vector,
-            # then re-optimizes x_int on the GP (warm-started from x_int_nominal,
-            # the post-jitter optimal, capped). Surrogate-only -- a cheap sweep;
-            # only the best draw is later confirmed against the real model.
-            # verbose=False keeps the per-draw inner-loop traces out of the log.
-            samples = []
-            for s in range(n_samples):
-                draws, zdraws = {}, {}   # bc_key -> drawn value / its z-score
-                for _ch, _fam, bc_key, nominal_val, roa_loc, sigma_abs in active:
-                    # Truncated standard normal -> draw within +/- n_sigma*sigma_abs
-                    z = float(np.clip(rng.standard_normal(), -n_sigma, n_sigma))
-                    val = nominal_val + z * sigma_abs
-                    draws[bc_key], zdraws[bc_key] = val, z
-                    powerstate.bc_dict[bc_key] = [val, roa_loc]
-                try:
-                    x_reopt, info = self._run_inner_lm(
-                        x_int_nominal, combined_gp, ctx,
-                        max_iter=max_reopt_iter,
-                        label=f"Phase3[MC {s + 1}/{n_samples}]",
-                        verbose=False,
-                    )
-                    phi_s, sigma_rel_s = _phi_at(x_reopt)
-                finally:
-                    for bc_key in draws:   # restore before the next draw
-                        powerstate.bc_dict[bc_key] = list(nominal_bc[bc_key])
-
-                samples.append({
-                    "sample": s,
-                    "x_lcfs": dict(draws),
-                    "z": dict(zdraws),
-                    "x_int_star": x_reopt.detach().cpu().numpy(),
-                    "phi": phi_s,
-                    "sigma_rel": sigma_rel_s,
-                    "delta_phi": phi_s - phi_nominal,
-                    "n_reopt_iter": info["n_iter"],
-                    "reopt_stop_reason": info["stop_reason"],
-                })
-
-            delta = np.array([s["delta_phi"] for s in samples])
-            phis = np.array([s["phi"] for s in samples])
-            sigma_rel_max = max([sigma_rel_nominal] + [s["sigma_rel"] for s in samples])
-            n_improving = int((delta > 0).sum())
-            frac_improving = n_improving / len(samples)
-            best_sample = max(samples, key=lambda s: s["delta_phi"])
-
-            def _shift_str(sample):
-                return ", ".join(
-                    f"{sample['x_lcfs'][k] - nominal_bc[k][0]:+.3e} on {k}"
-                    for k in sample["x_lcfs"]
-                )
-
-            # --- Real-model confirmation and refinement of the best draw -------
-            # The surrogate triages n_samples cheaply; the real transport model
-            # has the final word on whether a predicted reduction is real. The
-            # best draw is then optionally refined with iterative real-model
-            # evaluations + inner wLM re-optimization (lcfs_refine_n_evals).
-            y_nominal_real = torch.as_tensor(np.atleast_2d(self.train_Y[ind_best])).to(self.dfT)
-            _, _, phi_nominal_real_t = self.scalarized_objective(y_nominal_real)
-            phi_nominal_real = phi_nominal_real_t.squeeze().item()
-
-            best_sample_refined = self._refine_lcfs_candidate(
-                best_sample, nominal_bc, phi_nominal_real, combined_gp
-            )
-
-            # Determine validation status from the refined result
-            phi_real_final = best_sample_refined["phi_real_final"]
-            delta_phi_real_final = best_sample_refined["delta_phi_real_final"]
-            any_confirmed_better = delta_phi_real_final > 0
-            best_validated = best_sample_refined
-
-            # --- Outcome: can the objective be reduced by varying x_lcfs? -----
-            # phi is "a value to maximize" (= -residual), so delta_phi > 0 means
-            # a draw lowered the objective below the converged nominal. A claimed
-            # reduction is only credible above the surrogate's own noise floor,
-            # so the best draw must clear sigma_rel_nominal*|phi_nominal|.
-            noise_floor = sigma_rel_nominal * abs(phi_nominal)
-            if sigma_rel_max > sigma_rel_tol:
-                outcome = "insufficient_coverage"
-                verdict = (
-                    f"Surrogate uncertainty too large over the sampled x_lcfs range "
-                    f"(max sigma/|y|={sigma_rel_max:.3e} > {sigma_rel_tol}) -- take targeted "
-                    "real evaluations at perturbed x_lcfs before trusting this assessment"
-                )
-            elif best_sample["delta_phi"] > noise_floor:
-                outcome = "objective_reducible"
-                verdict = (
-                    f"Surrogate: the objective can be reduced further by moving x_lcfs within its "
-                    f"uncertainty -- best of {n_samples} draws improves by Delta phi = "
-                    f"{best_sample['delta_phi']:+.4e} (above the {noise_floor:.2e} surrogate noise floor; "
-                    f"{n_improving}/{len(samples)} = {frac_improving:.0%} of draws improve). Driving x_lcfs "
-                    f"shift: {_shift_str(best_sample)}. The modeled x_lcfs uncertainty is "
-                    "objective-consequential -- worth tightening the upstream edge-model estimate"
-                )
-            else:
-                outcome = "robust"
-                verdict = (
-                    f"No sampled x_lcfs (of {n_samples}) reduces the objective beyond the surrogate "
-                    f"noise floor ({noise_floor:.2e}); best Delta phi = {best_sample['delta_phi']:+.4e}. "
-                    "The converged solution is robust to the modeled x_lcfs uncertainty"
-                )
-
-            # Real-model check is the deciding word on a claimed reduction.
-            if best_validated:
-                if any_confirmed_better:
-                    x_int_final = best_validated.get("x_int_final", best_validated["x_int_star"])
-                    verdict += (
-                        f"  ||  REAL MODEL CONFIRMS a reduction (Delta phi_real = "
-                        f"{best_validated['delta_phi_real_final']:+.4e}; x_lcfs shift {_shift_str(best_validated)}; "
-                        f"x_int* = {x_int_final}) -- act on this"
-                    )
-                elif outcome == "objective_reducible":
-                    verdict += (
-                        "  ||  REAL MODEL DOES NOT CONFIRM the surrogate-predicted reduction at the "
-                        "best draw -- treat the surrogate-side finding as unconfirmed/likely surrogate noise"
-                    )
-                else:
-                    verdict += "  ||  real-model check on the best draw found no reduction -- consistent with the surrogate-side verdict"
-
-            # --- Report -------------------------------------------------------
-            print(f"\t\tnominal (real model):  phi_real={phi_nominal_real:+.4e}")
-            print(
-                f"\t\tre-optimized phi over {n_samples} draws:  min={phis.min():+.4e}  "
-                f"median={np.median(phis):+.4e}  max(best)={phis.max():+.4e}  "
-                f"[Delta phi range {delta.min():+.3e} .. {delta.max():+.3e}]"
-            )
-            print(f"\t\tdraws that reduce the objective: {n_improving}/{len(samples)} ({frac_improving:.0%})")
-            bs = best_sample_refined
-            real_str = ""
-            n_refine = bs.get("n_refine_evals", 0)
-            if n_refine > 0:
-                real_str = (
-                    f"   [refined: {n_refine} real eval(s) + inner wLM; "
-                    f"phi_final={bs['phi_real_final']:+.4e}  Delta_final={bs['delta_phi_real_final']:+.4e}]"
-                )
-            else:
-                real_str = f"   [real check: phi={bs['phi_real_final']:+.4e}  Delta={bs['delta_phi_real_final']:+.4e}]"
-            print(
-                f"\t\tbest draw (#{bs['sample']}):  phi={bs['phi']:+.4e}  Delta={bs['delta_phi']:+.4e}  "
-                f"({bs['n_reopt_iter']} reopt iters, {bs['reopt_stop_reason']}){real_str}"
-            )
-            print("\t\t  x_lcfs @ best draw:  " + "  ".join(
-                f"{k}={bs['x_lcfs'][k]:+.4e}(z={bs['z'][k]:+.2f})" for k in bs["x_lcfs"]
-            ))
-            print(f"\t\tverdict: {verdict}")
-
-            # Store optimized x_lcfs on the instance for persistence across post-analysis
-            # WARNING: if calculateBoundaryConditions() is called on powerstate after this,
-            # it will overwrite bc_dict with edge-model predictions, negating this optimization.
-            # Post-analysis code MUST apply best_x_lcfs_optimized if available.
-            self.best_x_lcfs_optimized = best_sample_refined.get("x_lcfs", {})
-            self.best_x_int_optimized = best_sample_refined.get("x_int_final", best_sample_refined.get("x_int_star"))
-
-            result = {
-                "outcome": outcome,
-                "verdict": verdict,
-                "n_samples": n_samples,
-                "phi_nominal": phi_nominal,
-                "phi_nominal_real": phi_nominal_real,
-                "sigma_rel_nominal": sigma_rel_nominal,
-                "noise_floor": noise_floor,
-                "n_improving": n_improving,
-                "frac_improving": frac_improving,
-                "delta_phi_min": float(delta.min()),
-                "delta_phi_max": float(delta.max()),
-                "samples": samples,
-                "best_sample_surrogate": best_sample,
-                "best_sample_refined": best_sample_refined,
-                "real_model_confirms_reduction": any_confirmed_better,
-                "n_refine_evals_performed": best_sample_refined.get("n_refine_evals", 0),
-                "best_x_lcfs_optimized": self.best_x_lcfs_optimized,
-                "best_x_int_optimized": self.best_x_int_optimized,
-            }
-
-        finally:
-            # Always leave the shared powerstate in its nominal state, and
-            # force one more rebuild so `powerstate.plasma` is consistent
-            # with the restored `bc_dict` (predict() invalidates its cache on
-            # every call regardless, but other code may read powerstate.plasma
-            # directly between now and the next surrogate evaluation).
-            for bc_key, (val, roa_loc) in nominal_bc.items():
-                powerstate.bc_dict[bc_key] = [val, roa_loc]
-            _ = _phi_at(x_int_star)
-
-        return result
 
 # ----------------------------------------------------------------------
 # Stopping criteria
@@ -3260,7 +2822,7 @@ def stopping_criteria_by_value(mitim_bo, maximum_value):
 
     # Grab scalarized objectives for each case
     print("\t- Checking maximum value so far...")
-    _, _, maximization_value = mitim_bo.scalarized_objective(torch.from_numpy(mitim_bo.train_Y).to(mitim_bo.dfT))
+    _, _, maximization_value = _scalarized_objective_with_X(mitim_bo.optimization_object, torch.from_numpy(mitim_bo.train_Y).to(mitim_bo.dfT), mitim_bo.train_X)
     yvals = maximization_value.cpu().numpy()
 
     # Best case (maximization)

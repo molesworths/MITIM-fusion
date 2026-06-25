@@ -23,6 +23,7 @@ from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Uni
 import numpy as np
 import torch
 import copy
+import math
 from scipy.interpolate import InterpolatedUnivariateSpline as linear, Akima1DInterpolator as akima, PchipInterpolator as pchip, CubicSpline
 from scipy.special import erf
 from scipy.optimize import curve_fit
@@ -1353,6 +1354,14 @@ class SplineMtanh(ParameterBase):
         self.fit_trf_diff_step = float(options.get('fit_trf_diff_step', 5e-2))
         # Single pointwise acceptance criterion: max relative error across all knot points.
         self.fit_max_rel_error = float(options.get('fit_max_rel_error', 2e-2))
+        # Fit strategy: with m,b eliminated analytically from the LCFS (y(1),aLy(1))
+        # BCs, the residual surface over {log_A,c,log_w1,r} is low-dimensional and
+        # effectively unimodal for monotone pedestal gradients. The warm-started
+        # TRF (cache/IDW seed) is the primary path and almost always clears the 2%
+        # acceptance in one solve; the additional fixed/interpolated starts below
+        # only fire as a cold-start fallback. fit_num_multistarts sets that fallback
+        # breadth (set to 2 to use only the two fixed starts).
+        self.fit_num_multistarts = int(options.get('fit_num_multistarts', 5))
         # Resolve cache: skip re-fitting when params+BCs are within tolerance of a prior call.
         self.fit_cache_enabled = bool(options.get('fit_cache_enabled', True))
         self.fit_cache_tol = float(options.get('fit_cache_tol', 1e-1))
@@ -1481,9 +1490,17 @@ class SplineMtanh(ParameterBase):
         aLy_bc: float,
         p0: Optional[np.ndarray] = None,
         accept_fn: Optional[Callable[[np.ndarray], bool]] = None,
-        num_multistarts: int = 5,
+        num_multistarts: Optional[int] = None,
     ) -> np.ndarray:
-        """Fit with configurable multistart points and optional warm-start seed."""
+        """Fit with configurable multistart points and optional warm-start seed.
+
+        The warm-start ``p0`` (cache/IDW seed) is tried first and, when it clears
+        ``accept_fn`` (the 2% acceptance), returned immediately as the primary
+        single-solve path. The fixed/interpolated starts act only as a cold-start
+        fallback whose breadth is ``num_multistarts`` (default ``fit_num_multistarts``).
+        """
+        if num_multistarts is None:
+            num_multistarts = self.fit_num_multistarts
         bounds = self._global_bounds()
         bounds_lo = np.array([b[0] for b in bounds], dtype=float)
         bounds_hi = np.array([b[1] for b in bounds], dtype=float)
@@ -1593,7 +1610,27 @@ class SplineMtanh(ParameterBase):
             rel = np.abs(model - aLy_fit) / np.maximum(np.abs(aLy_fit), 1e-3)
             return bool(np.max(rel) <= self.fit_max_rel_error)
 
-        popt = self._fit_multistart_trf(_residuals, y_bc, aLy_bc, p0=p0, accept_fn=_accept)
+        # Hot-path: a feasible warm start (cache/IDW/last-theta seed) gets a single
+        # bounded TRF solve. Off-family targets are *not* force-fit with multistart
+        # here — the residual is left for the cheap spline superposition in
+        # _evaluate_once. The multistart is reserved for the cold first call per
+        # profile (no warm start yet), keeping thousands of resolves fast.
+        if p0 is not None and self._is_feasible_theta(p0, y_bc, aLy_bc):
+            bounds = self._global_bounds()
+            lo = np.array([b[0] for b in bounds], dtype=float)
+            hi = np.array([b[1] for b in bounds], dtype=float)
+            p0_arr = np.minimum(np.maximum(np.asarray(p0, dtype=float).reshape(-1)[:4], lo), hi)
+            try:
+                fit = least_squares(
+                    _residuals, p0_arr, method='trf', bounds=(lo, hi),
+                    ftol=self.fit_trf_ftol, gtol=self.fit_trf_gtol, xtol=self.fit_trf_xtol,
+                    diff_step=self.fit_trf_diff_step, x_scale='jac', max_nfev=self.fit_max_nfev,
+                )
+                popt = np.asarray(fit.x, dtype=float)
+            except Exception:
+                popt = self._fit_multistart_trf(_residuals, y_bc, aLy_bc, p0=p0, accept_fn=_accept)
+        else:
+            popt = self._fit_multistart_trf(_residuals, y_bc, aLy_bc, p0=p0, accept_fn=_accept)
         return {
             'log_A': float(popt[0]),
             'c': float(popt[1]),
@@ -1644,14 +1681,22 @@ class SplineMtanh(ParameterBase):
         p0 = self._last_theta_guess.get(prof)
         if self.fit_cache_enabled:
             entries = self._resolve_cache.get(prof, [])
-            # 1. Exact hit: any entry within tolerance.
+            # 1. Exact hit: any entry within tolerance. Reuse the cached mtanh
+            #    *shape* (solver theta) but RE-ANCHOR m,b to the current BCs via
+            #    _to_physical so y(1)/aLy(1) are exact even when the cached entry
+            #    was fit for slightly different (within-tol) boundary conditions.
+            #    The spline superposition in _evaluate_once then matches the
+            #    interior knots exactly. Keeps off-family points ~O(1) on warm
+            #    calls (one _to_physical, no re-fit).
             for ck, cached_theta, cp in entries:
                 denom = np.maximum(np.abs(ck), 1e-8)
                 if np.max(np.abs(cache_key - ck) / denom) <= self.fit_cache_tol:
-                    if self._verify_resolve(vec, cp, y_bc, aLy_bc):
-                        return cp
-                    p0 = cached_theta
-                    break
+                    phys = self._to_physical(cached_theta, y_bc, aLy_bc)
+                    if phys is None:
+                        phys, _ = self._to_physical_projected(cached_theta, y_bc, aLy_bc)
+                    if phys is not None and np.all(np.isfinite(np.asarray(phys, dtype=float))):
+                        return phys
+                    return cp
             # 2. IDW interpolation over nearby entries in solver space,
             #    reprojected with current BCs. Uses same acceptance criterion as fitter.
             #    Distance is computed over knot-param dimensions only (first n entries);
@@ -1680,13 +1725,20 @@ class SplineMtanh(ParameterBase):
         fit = self._fit_mtanh_to_alys(self.knots, vec, y_bc, aLy_bc, p0=p0)
 
         seed = np.array([fit['log_A'], fit['c'], fit['log_w1'], fit['r']], dtype=float)
+        # Best-effort physical reconstruction. When the requested interior aLy is
+        # off the mtanh family the projected (penalised) state is still a good
+        # analytic base; the residual is absorbed by the spline superposition in
+        # _evaluate_once, so we do not bail to None here (that path is reserved
+        # for genuinely non-finite reconstructions only).
         phys = self._to_physical(seed, y_bc, aLy_bc)
-        if phys is None or not self._verify_resolve(vec, phys, y_bc, aLy_bc):
+        if phys is None:
+            phys, _ = self._to_physical_projected(seed, y_bc, aLy_bc)
+        if phys is None or not np.all(np.isfinite(np.asarray(phys, dtype=float))):
             return None
 
         self._last_theta_guess[prof] = seed
 
-        if self.fit_cache_enabled and phys is not None:
+        if self.fit_cache_enabled:
             entries = self._resolve_cache.setdefault(prof, [])
             if len(entries) >= self.fit_cache_max_size:
                 entries.pop(0)
@@ -1702,42 +1754,31 @@ class SplineMtanh(ParameterBase):
         params_std: Dict[str, Dict[str, float]] = {}
 
         x_data = np.asarray(getattr(state, 'roa')).flatten()
+        n = len(self.knots)
 
         for prof in self.predicted_profiles:
-            y_raw = np.asarray(getattr(state, prof)).flatten()
-            bc_y = self.get_nearest_bc(prof, 1.0)
-            bc_aLy = self.get_nearest_bc(f'aL{prof}', 1.0)
-            y_bc = float(bc_y['val']) if bc_y is not None else float(y_raw[-1]) if len(y_raw) else 1.0
-            aLy_bc = float(bc_aLy['val']) if bc_aLy is not None else 1.0
+            # The DVs are a/Ly at the interior knots, so parameterize the input
+            # profile by sampling its actual a/Ly there. This is robust and
+            # exact for any monotone profile -- unlike an mtanh re-fit, which can
+            # become infeasible for steep-BC channels and previously fell back to
+            # ZERO DVs (flat te/ne profiles). The mtanh+spline reconstruction in
+            # _resolve then renders these knot values back within tolerance.
+            aLy_name = f'aL{prof}'
+            if hasattr(state, aLy_name):
+                aLy_prof = np.asarray(getattr(state, aLy_name)).flatten()
+            else:
+                y_raw = np.asarray(getattr(state, prof)).flatten()
+                y_safe = np.where(np.abs(y_raw) < self._Y_FLOOR, self._Y_FLOOR, y_raw)
+                aLy_prof = -np.gradient(y_raw, x_data) / y_safe
 
-            p0_default = np.array([np.log(0.5), 0.95, np.log(0.10), np.log(0.05)], dtype=float)
-            y_scale = np.maximum(y_raw, 1e-6)
+            if aLy_prof.shape[0] != x_data.shape[0]:
+                # Fall back to a numeric gradient if the stored aL grid mismatches.
+                y_raw = np.asarray(getattr(state, prof)).flatten()
+                y_safe = np.where(np.abs(y_raw) < self._Y_FLOOR, self._Y_FLOOR, y_raw)
+                aLy_prof = -np.gradient(y_raw, x_data) / y_safe
 
-            def _residual_joint(p):
-                phys, violation = self._to_physical_projected(p, y_bc, aLy_bc)
-                A, D0, delta, m, c, b = phys
-                y_model = self._y_mtanh(x_data, A, D0, delta, m, c, b)
-                res_data = (y_model - y_raw) / y_scale
-                penalty = np.sqrt(self.fit_penalty_weight) * violation
-                return np.concatenate([res_data, penalty])
-
-            popt = self._fit_multistart_trf(_residual_joint, y_bc, aLy_bc)
-
-            phys = self._to_physical(popt, y_bc, aLy_bc)
-            if phys is None:
-                phys = self._to_physical(p0_default, y_bc, aLy_bc)
-                if phys is None:
-                    params[prof] = {name: 0.0 for name in self.param_names}
-                    params_std[prof] = {name: 0.0 for name in self.param_names}
-                    continue
-            A, D0, delta, m, c, b = phys
-
-            n = len(self.knots)
-            dydx_k = self._dydx_mtanh(self.knots, A, D0, delta, m, c)
-            y_k = self._y_mtanh(self.knots, A, D0, delta, m, c, b)
-            y_safe = np.where(np.abs(y_k) < self._Y_FLOOR, self._Y_FLOOR, y_k)
-            aLy_vec = np.clip(-dydx_k / y_safe, 0.0, None)
-            pdict = {f'aLy{i}': float(aLy_vec[i]) for i in range(n)}
+            aLy_knots = np.clip(np.interp(self.knots, x_data, aLy_prof), 0.0, None)
+            pdict = {f'aLy{i}': float(aLy_knots[i]) for i in range(n)}
 
             params[prof] = pdict
             params_std[prof] = {k: abs(v) * self.sigma for k, v in pdict.items()}
@@ -1758,7 +1799,7 @@ class SplineMtanh(ParameterBase):
         for prof, pv in batch_params.items():
             phys = self._resolve(prof, pv)
             if phys is None:
-                # Lazily construct an Akima Spline fallback with the same knots/defined_on.
+                # Genuine non-finite reconstruction (rare): full Akima spline fallback.
                 if not hasattr(self, '_spline_fallback') or self._spline_fallback is None:
                     fallback_options = {
                         'knots': self.knots.tolist(),
@@ -1771,28 +1812,167 @@ class SplineMtanh(ParameterBase):
                     self._spline_fallback = Spline(fallback_options)
                 self._spline_fallback.bc_dict = self.bc_dict
                 single_params = {prof: pv}
-                y_fb   = self._spline_fallback.get_y(single_params, x_1d)
-                aLy_fb = self._spline_fallback.get_aLy(single_params, x_1d)
-                curv_fb = self._spline_fallback.get_curvature(single_params, x_1d)
-                y_out[prof]    = y_fb[prof]
-                aLy_out[prof]  = aLy_fb[prof]
-                curv_out[prof] = curv_fb[prof]
+                y_out[prof]    = self._spline_fallback.get_y(single_params, x_1d)[prof]
+                aLy_out[prof]  = self._spline_fallback.get_aLy(single_params, x_1d)[prof]
+                curv_out[prof] = self._spline_fallback.get_curvature(single_params, x_1d)[prof]
                 continue
 
             A, D0, delta, m, c, b = phys
-            y = np.clip(self._y_mtanh(x_1d, A, D0, delta, m, c, b), 0.0, None)
+            y_base = np.clip(self._y_mtanh(x_1d, A, D0, delta, m, c, b), 0.0, None)
             dydx = self._dydx_mtanh(x_1d, A, D0, delta, m, c)
-            y_safe = np.where(np.abs(y) < self._Y_FLOOR, self._Y_FLOOR, y)
+            y_safe = np.where(np.abs(y_base) < self._Y_FLOOR, self._Y_FLOOR, y_base)
+            aLy_base = np.clip(-dydx / y_safe, 0.0, None)
 
-            y_base    = y
-            aLy_base  = np.clip(-dydx / y_safe, 0.0, None)
-            curv_base = self._d2ydx2_mtanh(x_1d, A, D0, delta, c)
-
-            y_out[prof]    = y_base
-            aLy_out[prof]  = aLy_base
-            curv_out[prof] = curv_base
+            # Spline residual superposition: when the requested interior aLy is off
+            # the mtanh family, correct only the residual (target - mtanh) at the
+            # knots with a spline that vanishes at the axis and the LCFS, so both
+            # BCs are preserved. The mtanh base stays analytic; the correction is
+            # the cheap extra term. y_corr = y_base * exp(int_x^1 Delta dx').
+            corr = self._aLy_correction(prof, pv, A, D0, delta, m, c, b)
+            if corr is None:
+                y_out[prof]    = y_base
+                aLy_out[prof]  = aLy_base
+                curv_out[prof] = self._d2ydx2_mtanh(x_1d, A, D0, delta, c)
+            else:
+                delta_aLy = corr(x_1d)
+                cum = cumulative_trapezoid(delta_aLy, x_1d, initial=0.0)
+                phase = np.clip(cum[-1] - cum, -10.0, 10.0)  # int_x^1 Delta dx'
+                y_corr = np.clip(y_base * np.exp(phase), 0.0, None)
+                aLy_corr = np.clip(aLy_base + delta_aLy, 0.0, None)
+                y_safe2 = np.where(np.abs(y_corr) < self._Y_FLOOR, self._Y_FLOOR, y_corr)
+                # curvature from corrected profile (numeric; correction path only).
+                d1 = np.gradient(y_corr, x_1d)
+                curv_out[prof] = np.gradient(d1, x_1d)
+                y_out[prof]   = y_corr
+                aLy_out[prof] = aLy_corr
+                _ = y_safe2
 
         return y_out, aLy_out, curv_out, batch_params
+
+    def _eval_once_torch(self, phys_shape, y_bc, aLy_bc, x):
+        """Torch-native analytic mtanh eval that keeps the graph to the BCs.
+
+        The fitted *shape* ``phys_shape = (A, Delta_0, delta, c)`` is treated as
+        a detached constant (it comes from the numpy ``least_squares`` fit). The
+        boundary conditions ``y_bc, aLy_bc`` are live torch scalars: they enter
+        ``y(x)`` only through the analytically eliminated background slope ``m``
+        and offset ``b`` (see ``_to_physical_projected``), so ``dy/d(aLy_bc)`` and
+        ``dy/d(y_bc)`` flow by chain rule. Mirrors ``_y_mtanh``/``_dydx_mtanh``
+        exactly; no fit is differentiated (interior-knot deps live in the
+        detached shape and are intentionally not carried here).
+
+        Returns (y, aLy) as torch tensors on the same dtype/device as ``x``.
+        """
+        A, Delta_0, delta, c = (float(v) for v in phys_shape)
+
+        # LCFS-side scalars are functions of the detached shape only.
+        w2 = Delta_0 * math.exp(delta * (1.0 - c))          # w(1)
+        u1 = (1.0 - c) / w2
+        u1p = (1.0 - delta * (1.0 - c)) / w2
+        sech2_1 = 0.0 if abs(u1) > 20.0 else 1.0 - math.tanh(u1) ** 2
+
+        y_bc = y_bc.to(x)
+        aLy_bc = aLy_bc.to(x)
+
+        # m, b eliminated from (aLy(1), y(1)) -> the only BC-dependent terms.
+        m = y_bc * aLy_bc - A * sech2_1 * u1p
+        b = y_bc - A * (1.0 - math.tanh(u1))
+
+        w = Delta_0 * torch.exp(delta * (x - c))            # w(x), const
+        u = (x - c) / w
+        tanh_u = torch.tanh(u)
+        uprime = (1.0 - delta * (x - c)) / w
+
+        y = A * (1.0 - tanh_u) - m * (x - 1.0) + b
+        dydx = -A * (1.0 - tanh_u ** 2) * uprime - m
+
+        y = torch.clamp(y, min=0.0)
+        y_safe = torch.where(y.abs() < self._Y_FLOOR, torch.full_like(y, self._Y_FLOOR), y)
+        aLy = torch.clamp(-dydx / y_safe, min=0.0)
+        return y, aLy
+
+    def _torch_grad_overlay(self, prof, pv, bc_dict, batch_idx, x_t, y_np, aLy_np):
+        """Attach the analytic LCFS gradient to numpy values via straight-through.
+
+        Returns torch (y, aLy) whose *values* equal the faithful numpy outputs
+        (so correction / fallback / clamps are preserved) but whose *gradient*
+        w.r.t. the live BC tensors is that of ``_eval_once_torch``. Returns None
+        when the BCs for this profile are not live tensors (nothing to carry).
+        """
+        # BC vals may be either per-batch (size batch_size, e.g. aLy driven by
+        # the LCFS DVs) or a single broadcast value (size 1, e.g. a Fixed y model
+        # that is constant across the batch). Index per-batch when sized so, else
+        # broadcast the lone entry.
+        def _bc_at(val, idx):
+            flat = val.reshape(-1)
+            return flat[idx] if flat.numel() > 1 else flat[0]
+
+        aLy_key, y_key = f"aL{prof}", prof
+        aLy_entry = bc_dict.get(aLy_key) if isinstance(bc_dict, dict) else None
+        if not (isinstance(aLy_entry, dict) and torch.is_tensor(aLy_entry.get("val"))):
+            return None
+        aLy_bc = _bc_at(aLy_entry["val"], batch_idx)
+        if not aLy_bc.requires_grad:
+            return None
+
+        y_entry = bc_dict.get(y_key) if isinstance(bc_dict, dict) else None
+        if isinstance(y_entry, dict) and torch.is_tensor(y_entry.get("val")):
+            y_bc = _bc_at(y_entry["val"], batch_idx)
+        else:
+            # y(1) BC is a fixed scalar (no DV); read the numpy BC value.
+            bc_y = self.get_nearest_bc(y_key, 1.0)
+            if bc_y is None:
+                return None
+            y_bc = torch.as_tensor(float(bc_y["val"])).to(x_t)
+
+        phys = self._resolve(prof, pv)
+        if phys is None:
+            return None
+        A, D0, delta, m, c, b = phys
+        y_t, aLy_t = self._eval_once_torch((A, D0, delta, c), y_bc, aLy_bc, x_t)
+
+        y_ref = torch.as_tensor(np.asarray(y_np, dtype=float)).to(x_t)
+        aLy_ref = torch.as_tensor(np.asarray(aLy_np, dtype=float)).to(x_t)
+        # Straight-through: value = numpy (faithful), grad = analytic torch eval.
+        y_out = y_t + (y_ref - y_t).detach()
+        aLy_out = aLy_t + (aLy_ref - aLy_t).detach()
+        return y_out, aLy_out
+
+    def _aLy_correction(self, prof, prof_params, A, D0, delta, m, c, b):
+        """
+        Build the spline residual-correction Delta(x) = aLy_target - aLy_mtanh at
+        the interior knots, or return None when the mtanh base already matches
+        within ``fit_max_rel_error`` (the fast pure-analytic path).
+
+        Delta is pinned to 0 at the axis (x=0) and at the LCFS (x=1) so the
+        superposition leaves both boundary conditions untouched.
+        """
+        n = len(self.knots)
+        if n == 0:
+            return None
+        if isinstance(prof_params, dict):
+            target = np.array([float(prof_params[name]) for name in self.param_names], dtype=float)
+        else:
+            target = np.asarray(prof_params, dtype=float).reshape(-1)[:n]
+
+        knots = np.asarray(self.knots, dtype=float)
+        y_k = self._y_mtanh(knots, A, D0, delta, m, c, b)
+        dydx_k = self._dydx_mtanh(knots, A, D0, delta, m, c)
+        y_safe = np.where(np.abs(y_k) < self._Y_FLOOR, self._Y_FLOOR, y_k)
+        model = np.clip(-dydx_k / y_safe, 0.0, None)
+
+        resid = target - model
+        rel = np.max(np.abs(resid) / np.maximum(np.abs(target), 1e-3))
+        if rel <= self.fit_max_rel_error:
+            return None  # fast path: analytic mtanh already within tolerance
+
+        # Endpoints pinned to zero (axis + LCFS) so BCs are preserved.
+        xs = np.concatenate(([0.0], knots, [1.0]))
+        ds = np.concatenate(([0.0], resid, [0.0]))
+        # Deduplicate any knot coinciding with the endpoints.
+        xs, idx = np.unique(xs, return_index=True)
+        ds = ds[idx]
+        return pchip(xs, ds, extrapolate=True)
 
     def update(self, params: Dict[str, np.ndarray], bc_dict: Dict[str, Any], x_eval: np.ndarray):
         """Evaluate SplineMtanh outputs with a single resolve per profile.
@@ -1852,26 +2032,50 @@ class SplineMtanh(ParameterBase):
         else:
             self.build_bcs(bc_dict)
 
-        y_batches: Dict[str, List[np.ndarray]] = {}
-        aLy_batches: Dict[str, List[np.ndarray]] = {}
+        # Torch x grid (per batch) so the grad overlay can ride the live BC graph.
+        x_is_tensor = torch.is_tensor(x_eval) and x_eval.dim() >= 2
+
+        y_batches: Dict[str, List[Any]] = {}
+        aLy_batches: Dict[str, List[Any]] = {}
         curv_batches: Dict[str, List[np.ndarray]] = {}
+        # Per-profile flag: any batch item carries a live BC graph -> stack as torch.
+        grad_profiles: set = set()
 
         for i in range(batch_size):
             if use_batched_bcs:
                 self.build_bcs(self._slice_batched_bc_dict(bc_dict, i, batch_size))
-            y_i, aLy_i, curv_i, _ = self._evaluate_once(
-                _slice_params_for_batch(params, i, batch_size),
-                x_arr[i],
-            )
-            for prof, vals in y_i.items():
-                y_batches.setdefault(prof, []).append(np.asarray(vals, dtype=float))
-            for prof, vals in aLy_i.items():
-                aLy_batches.setdefault(prof, []).append(np.asarray(vals, dtype=float))
+            batch_params = _slice_params_for_batch(params, i, batch_size)
+            y_i, aLy_i, curv_i, _ = self._evaluate_once(batch_params, x_arr[i])
+
             for prof, vals in curv_i.items():
                 curv_batches.setdefault(prof, []).append(np.asarray(vals, dtype=float))
 
-        y_out = {prof: np.stack(vals, axis=0) for prof, vals in y_batches.items()}
-        aLy_out = {prof: np.stack(vals, axis=0) for prof, vals in aLy_batches.items()}
+            for prof in y_i:
+                y_val, aLy_val = y_i[prof], aLy_i[prof]
+                overlay = None
+                if use_batched_bcs and x_is_tensor:
+                    overlay = self._torch_grad_overlay(
+                        prof, batch_params.get(prof), bc_dict, i, x_eval[i],
+                        y_val, aLy_val,
+                    )
+                if overlay is not None:
+                    grad_profiles.add(prof)
+                    y_batches.setdefault(prof, []).append(overlay[0])
+                    aLy_batches.setdefault(prof, []).append(overlay[1])
+                else:
+                    y_batches.setdefault(prof, []).append(np.asarray(y_val, dtype=float))
+                    aLy_batches.setdefault(prof, []).append(np.asarray(aLy_val, dtype=float))
+
+        def _stack(batches, prof):
+            vals = batches[prof]
+            if prof in grad_profiles:
+                ref = next(v for v in vals if torch.is_tensor(v))
+                vals = [v if torch.is_tensor(v) else torch.as_tensor(np.asarray(v, dtype=float)).to(ref) for v in vals]
+                return torch.stack(vals, dim=0)
+            return np.stack(vals, axis=0)
+
+        y_out = {prof: _stack(y_batches, prof) for prof in y_batches}
+        aLy_out = {prof: _stack(aLy_batches, prof) for prof in aLy_batches}
         curv_out = {prof: np.stack(vals, axis=0) for prof, vals in curv_batches.items()}
 
         self.y = y_out

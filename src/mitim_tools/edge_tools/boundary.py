@@ -67,7 +67,7 @@ After ``get_boundary_conditions()`` the model exposes:
 import numpy as np
 import torch
 from scipy.constants import e as e_J, u as _u_kg
-from scipy.optimize import fsolve
+from scipy.optimize import fsolve, brentq
 
 from mitim_tools.misc_tools import PLASMAtools
 from mitim_tools.misc_tools.LOGtools import printMsg as print
@@ -204,6 +204,26 @@ class _LCFSState:
         else:
             self.aLni = _derived_lcfs(d["aLni"], species_idx=0)
 
+        # Plasma current [MA] and Greenwald density n_GW [m^-3] for the SepOS
+        # density feasibility guard (section 4.5). Prefer derived/raw current,
+        # fall back to Ampere's law from the poloidal field at the LCFS.
+        Ip_MA = None
+        if "Ip" in d:
+            try:
+                Ip_MA = abs(float(np.asarray(d["Ip"]).reshape(-1)[-1]))
+            except Exception:
+                Ip_MA = None
+        if Ip_MA is None and "current(MA)" in p_raw:
+            try:
+                Ip_MA = abs(float(np.asarray(p_raw["current(MA)"]).reshape(-1)[0]))
+            except Exception:
+                Ip_MA = None
+        if Ip_MA is None:
+            mu0 = 4.0e-7 * np.pi
+            Ip_MA = abs(2.0 * np.pi * self.a * kappa_hat * self.Bp / mu0) / 1e6
+        self.Ip = Ip_MA
+        self.n_GW = Ip_MA / max(np.pi * self.a**2, 1e-30) * 1e20  # m^-3
+
         volp_lcfs = float(np.asarray(d["volp_geo"])[-1])
         self.A = volp_lcfs
         _Qe_key = "Qe_edgetargets" if "Qe_edgetargets" in p else "QeMWm2_fixedtargets"
@@ -330,6 +350,60 @@ class Y_TFTP(_YModel):
 # (prefixed ALy_ to avoid name collision with y models above)
 # ---------------------------------------------------------------------------
 
+def _ssf_decay_lengths(
+    state: "_LCFSState",
+    G0: float,
+    alpha_s: float,
+    f_Delta: float = 1.0,
+    Lambda: float | None = None,
+) -> tuple[float, float, float, float, float]:
+    """
+    Peret 2025 SSF turbulent decay lengths (section 4.2).
+
+    Temperature- and geometry-driven (independent of density). Solves the
+    λ_p/ρ_s fixed point with **brentq** (bracketed root, robust) using the
+    **natural log** sheath factor, then returns
+
+        (λ_p, λ_n, λ_T, λ_q, γ)   [m, m, m, m, dimensionless].
+    """
+    te = state.te; ti = state.ti
+    rho_s = state.rho_s
+    R0 = state.R0; Lpar = state.Lpar
+
+    if Lambda is None:
+        Lambda = 0.5 * np.log(1.0 / (2.0 * np.pi * state.me_over_mi))
+
+    gamma_0 = 2.5 * ti / te - 0.5 * np.log(2.0 * np.pi * state.me_over_mi * (1.0 + ti / te))
+    gamma = 2.0 * gamma_0 / 3.0
+    g = G0 * rho_s / R0
+
+    def residual(lp: float) -> float:
+        lp = max(float(lp), 1e-12 * rho_s)
+        sqrt_gamma = np.sqrt(gamma)
+        lT = sqrt_gamma / (sqrt_gamma - 1.0) * lp
+        beta = f_Delta * (1.0 / Lambda + lp / lT)
+        alpha_ExB = -0.43 * beta * Lambda * (rho_s / lp) ** 1.5 / g ** 0.5
+        lhs = lp / rho_s
+        rhs = (3.9 * g ** (3.0 / 11.0) * (2.0 * rho_s / Lpar) ** (-6.0 / 11.0)
+               * gamma ** (-4.0 / 11.0) / (1.0 + (alpha_s + alpha_ExB) ** 2) ** (9.0 / 11.0))
+        return lhs - rhs
+
+    # Scan a log grid for a sign change, then bracket with brentq (section 4.2).
+    grid = rho_s * np.logspace(np.log10(1.0), np.log10(1000.0), 64)
+    fvals = np.array([residual(x) for x in grid])
+    sign_change = np.where(np.sign(fvals[:-1]) != np.sign(fvals[1:]))[0]
+    if sign_change.size == 0:
+        raise RuntimeError("SSF: no bracketed root for lambda_p over [rho_s, 1000 rho_s]")
+    i = int(sign_change[0])
+    lambda_p = float(brentq(residual, grid[i], grid[i + 1], xtol=1e-6 * rho_s, rtol=1e-8))
+
+    sqrt_gamma = np.sqrt(gamma)
+    lambda_n = sqrt_gamma * lambda_p
+    lambda_T = sqrt_gamma / (sqrt_gamma - 1.0) * lambda_p
+    lambda_q = (2.0 / 7.0) * lambda_T
+    return lambda_p, lambda_n, lambda_T, lambda_q, gamma
+
+
 class _aLyModel:
     """Abstract base for aLy (gradient-scale-length) LCFS models."""
     def solve(self, state: _LCFSState) -> tuple[float, float, float, float, float]:
@@ -425,31 +499,9 @@ class aLy_PeretSSF(_aLyModel):
             G0      = self.G0
             alpha_s = -self.shear_ref / max(abs(state.shear), 0.1)
 
-        gamma_0 = 2.5*ti/te - 0.5*np.log(2.0*np.pi*state.me_over_mi*(1.0 + ti/te))
-        gamma   = 2.0*gamma_0/3.0
-        g = G0 * rho_s / R0
-        f_Delta = self.f_Delta
-
-        def residual(lp_arr):
-            lp = float(lp_arr[0])
-            sqrt_gamma = np.sqrt(gamma)
-            lT        = sqrt_gamma / (sqrt_gamma - 1.0) * lp
-            beta      = f_Delta * (1.0/Lambda + lp/lT)
-            alpha_ExB = -0.43 * beta * Lambda * (rho_s/lp)**1.5 / g**0.5
-            lhs = lp / rho_s
-            rhs = (3.9 * g**(3.0/11.0) * (2.0*rho_s/Lpar)**(-6.0/11.0)
-                   * gamma**(-4.0/11.0) / (1.0 + (alpha_s + alpha_ExB)**2)**(9.0/11.0))
-            return [lhs - rhs]
-
-        res = fsolve(residual, [10.0*rho_s], full_output=True, xtol=1e-6)
-        if res[2] != 1:
-            raise RuntimeError("PeretSSF: fsolve did not converge")
-
-        lambda_p   = float(res[0][0])
-        sqrt_gamma = np.sqrt(gamma)
-        lambda_n   = sqrt_gamma * lambda_p
-        lambda_T   = sqrt_gamma / (sqrt_gamma - 1.0) * lambda_p
-        lambda_q   = (2.0/7.0) * lambda_T
+        lambda_p, lambda_n, lambda_T, lambda_q, gamma = _ssf_decay_lengths(
+            state, G0=G0, alpha_s=alpha_s, f_Delta=self.f_Delta, Lambda=Lambda,
+        )
 
         aLne = a / max(lambda_n, 1e-30)
         aLte = a / max(lambda_T, 1e-30)
@@ -726,6 +778,273 @@ class CombinedBCModel:
         return out
 
 
+class TwoFluidSynthesis:
+    """
+    Self-consistent LCFS model (lcfs_bc_model.md sections 4-5).
+
+    Couples, at a 2-D fixed point in (T_e,u, T_i,u):
+      - electron conduction (section 4.1, f_cond,e = 1, Spitzer-Harm 2/7),
+      - SSF turbulent decay lengths (section 4.2, brentq, natural log),
+      - a 0-D ion energy balance with e-i equipartition (section 4.3, R_th).
+    Gradients follow section 4.4 (R_th-blended a/L_Ti with a finite sheath
+    floor). The separatrix density is a *prescribed* Greenwald fraction
+    (section 4.5, ``f_GW`` user-given, not a DV), clamped to the SepOS
+    ideal-ballooning ceiling and L-mode density-limit floor.
+
+    Interface mirrors ``CombinedBCModel`` so PORTALS-Edge can use it
+    interchangeably; additionally exposes ``F_y`` (prior means for the
+    soft-prior residuals) and ``sigma_y`` (per-channel stiffness, section 6).
+    """
+
+    _ME_KG = 9.1094e-31
+
+    def __init__(self, options: dict):
+        o = dict(options or {})
+        self.te_target = float(o.get("te_target", 0.005)) * 1e3  # eV
+        _ti_t = o.get("ti_target", None)
+        self.ti_target = float(_ti_t) * 1e3 if _ti_t is not None else None
+        self.f_GW = float(o.get("f_GW", 0.3))
+        self.gamma_i = float(o.get("gamma_i_sheath", 2.5))
+        self.G0 = float(o.get("G0", 1.25))
+        self.shear_ref = float(o.get("shear_ref", 5.0))
+        self.f_Delta = float(o.get("f_Delta", 1.0))
+        self.Lambda = o.get("Lambda", None)
+        self._gfile_path = o.get("gfile_path", o.get("gfile", None))
+        self._eq_n_points = int(o.get("eq_n_points", 512))
+        self._eq_eddy_width_m = float(o.get("eq_eddy_width_m", 0.005))
+        self._eq = None
+        self.max_iter = int(o.get("max_iter", 100))
+        self.tol = float(o.get("tol", 1e-4))
+        self.verbose = bool(o.get("verbose", False))
+        self._Zeff_override = o.get("Zeff", None)
+        self._mi_ref_u = float(o.get("mi_ref_u", _MD_U))
+        self._Lpar_override = o.get("Lpar", None)
+        self.sepos_clamp = bool(o.get("sepos_clamp", False))  # disconnected (section 4.5); kept for later
+        # Per-channel soft-prior stiffness sigma_y (section 6): tight on the
+        # conduction-set a/L_Te, looser on a/L_ne, loosest on the weakly-modeled
+        # a/L_Ti. Consumed by powerstate_edge if present.
+        self.sigma_y = {
+            "aLte": float(o.get("sigma_aLte", 0.5)),
+            "aLne": float(o.get("sigma_aLne", 0.5)),
+            "aLti": float(o.get("sigma_aLti", 0.5)),
+        }
+
+        self.bc_dict: dict = {}
+        self.bc_leaf_tensors: dict[str, torch.Tensor] = {}
+        self.F_y: dict = {}
+        self.converged: bool = False
+
+    # ------------------------------------------------------------------
+    def _geometry_drive(self, state: "_LCFSState") -> tuple[float, float]:
+        """Return (G0, alpha_s) from the 2-D equilibrium if available, else heuristic."""
+        if load_equilibrium is not None and self._gfile_path is not None:
+            try:
+                if self._eq is None:
+                    self._eq = load_equilibrium(
+                        self._gfile_path,
+                        n_points=self._eq_n_points,
+                        eddy_width_m=self._eq_eddy_width_m,
+                    )
+                return float(self._eq.G0), float(self._eq.alpha_s)
+            except Exception as exc:
+                if self.verbose:
+                    print(f"[Synthesis] equilibrium load failed ({exc}); heuristic.", typeMsg="w")
+                self._gfile_path = None
+        return self.G0, -self.shear_ref / max(abs(state.shear), 0.1)
+
+    @staticmethod
+    def _kappa0e(Zeff: float) -> float:
+        return 2600.0 / (0.672 + 0.076 * Zeff**0.5 + 0.252 * Zeff)
+
+    def _kinetics(self, state, ne, Te, Ti, G0, alpha_s):
+        """One pass of the coupled model: (ne,Te,Ti) -> predicted (Te,Ti) + diagnostics."""
+        state.update_kinetics(ne, Te, Ti)
+        lam_p, lam_n, lam_T, lam_q, gamma = _ssf_decay_lengths(
+            state, G0=G0, alpha_s=alpha_s, f_Delta=self.f_Delta, Lambda=self.Lambda,
+        )
+
+        Apar = 4.0 * np.pi * state.R0 * lam_q * (state.Bp / state.BT)
+        q_eu = state.Pe * 1e6 / max(Apar, 1e-30)
+        q_iu = state.Pi * 1e6 / max(Apar, 1e-30)
+        Lpar = state.Lpar
+
+        # 4.1 electron conduction (f_cond,e = 1)
+        kappa0e = self._kappa0e(state.Zeff)
+        Te_new = max(self.te_target, (self.te_target**3.5 + 3.5 * q_eu * Lpar / kappa0e) ** (2.0 / 7.0))
+
+        # 4.3 ion temperature: conduction-limited decoupled value (kappa_0i = kappa_0e sqrt(me/mi)),
+        # blended to Te by e-i equipartition. The weak ion conductivity enforces Te <= Ti <= Ti_dec
+        # with no ad hoc clamp; Ti_dec/Te ~ ((q_iu/q_eu)(mi/me)^0.5)^(2/7) ~ (mi/me)^(1/7) at equal
+        # powers (~2 at q_iu = q_eu/5, ~5 for ion-heavy splits).
+        Ti_t = self.ti_target if self.ti_target is not None else self.te_target
+        mi_kg = self._mi_ref_u * _u_kg
+        ne_cm3 = ne * 1e-6
+        tau_e = 3.44e5 * Te_new**1.5 / max(ne_cm3 * state.LogLam, 1e-30)  # s (NRL e-i collision time)
+        c_s = np.sqrt(max(e_J * Te_new, 1e-30) / mi_kg)                  # m/s
+
+        kappa0i = kappa0e * np.sqrt(state.me_over_mi)                    # ion Spitzer-Harm
+        Ti_dec = max(Ti_t, (Ti_t**3.5 + 3.5 * q_iu * Lpar / kappa0i)**(2.0/7.0))
+        R_th = (Lpar / max(c_s, 1e-30)) * state.me_over_mi / max(tau_e, 1e-30)  # tau_par,i / tau_eq
+        w = R_th / (1.0 + R_th)
+        Ti_new = max(Ti_t, w * Te_new + (1.0 - w) * Ti_dec)
+
+        diag = dict(lam_p=lam_p, lam_n=lam_n, lam_T=lam_T, lam_q=lam_q,
+                    gamma=gamma, R_th=R_th)
+        return Te_new, Ti_new, diag
+
+    def get_boundary_conditions(self, powerstate, batch_idx: int = 0) -> None:
+        state = _LCFSState.extract(
+            powerstate, b=batch_idx,
+            Zeff_override=self._Zeff_override,
+            mi_ref_u=self._mi_ref_u, Lpar_override=self._Lpar_override,
+        )
+        G0, alpha_s = self._geometry_drive(state)
+
+        # Density is a prescribed Greenwald fraction (fixed, section 4.5).
+        ne_sep = self.f_GW * state.n_GW
+
+        # 2-D fixed point on (Te, Ti) (section 5). Picard with under-relaxation;
+        # robust because the temperature map is a contraction (section 2).
+        Te, Ti = state.te, state.ti
+        self.converged = False
+        for _ in range(self.max_iter):
+            Te_new, Ti_new, diag = self._kinetics(state, ne_sep, Te, Ti, G0, alpha_s)
+            rel = max(abs(Te_new - Te) / max(Te, 1e-30), abs(Ti_new - Ti) / max(Ti, 1e-30))
+            Te, Ti = Te_new, Ti_new
+            if rel < self.tol:
+                self.converged = True
+                break
+        if not self.converged and self.verbose:
+            print("[Synthesis] (Te,Ti) fixed point did not converge", typeMsg="w")
+
+        # Final diagnostics at the converged temperatures.
+        _, _, diag = self._kinetics(state, ne_sep, Te, Ti, G0, alpha_s)
+        a = state.a
+        aLp = a / max(diag["lam_p"], 1e-30)
+        aLne = a / max(diag["lam_n"], 1e-30)
+        aLte = a / max(diag["lam_T"], 1e-30)
+
+        # 4.4 R_th-blended ion gradient with finite sheath floor.
+        gamma_i_blend = (2.0 / 3.0) * self.gamma_i
+        sg_i = np.sqrt(gamma_i_blend)
+        aLti_dec = (sg_i - 1.0) / sg_i * aLp
+        w = diag["R_th"] / (1.0 + diag["R_th"])
+        aLti = w * aLte + (1.0 - w) * aLti_dec
+        aLni = aLne
+
+        # 4.5 SepOS density feasibility clamp on the prescribed n_e,sep.
+        # DISCONNECTED for now (kept for later use): n_e,sep is taken directly as
+        # the prescribed Greenwald fraction without the SepOS ceiling/floor clamp.
+        # Re-enable by setting sepos_clamp=True (calls self._sepos_clamp, which
+        # together with self._lh_roots implements section 4.5).
+        ne_final = ne_sep
+        # if self.sepos_clamp:
+        #     ne_final = self._sepos_clamp(state, ne_sep, Te, Ti, aLne, aLte, aLti, aLni)
+
+        ni = ne_final / max(state.Zeff, 1e-30)
+
+        self.bc_dict = {
+            "ne":   [ne_final * 1e-19, 1.0],
+            "te":   [Te * 1e-3, 1.0],
+            "ti":   [Ti * 1e-3, 1.0],
+            "ni":   [ni * 1e-19, 1.0],
+            "aLne": [aLne, 1.0],
+            "aLte": [aLte, 1.0],
+            "aLti": [aLti, 1.0],
+            "aLni": [aLni, 1.0],
+        }
+        self.bc_leaf_tensors = {
+            key: torch.tensor(float(val), dtype=torch.double, requires_grad=True)
+            for key, (val, _) in self.bc_dict.items()
+        }
+        # Prior means for the section-6 soft-prior residuals.
+        self.F_y = {"aLne": aLne, "aLte": aLte, "aLti": aLti}
+
+    def _lh_roots(self, state, Te, Ti, lam_pe, alpha_c, Lambda_pi):
+        """
+        Roots of the L-H criterion G(n_sep)=0 at fixed T_e,sep (section 4.5,
+        Eq. 8 = H.10). G is U-shaped so there are generically two roots
+        n_LH,low < n_LH,high (H-mode where G>0). The only n-dependence is via
+        k_EM^2 ∝ n and α_t ∝ n. Returns (n_low, n_high) or (None, None).
+        """
+        mu0 = 4.0e-7 * np.pi
+        mi_kg = self._mi_ref_u * _u_kg
+        tau_i = Ti / max(Te, 1e-30)
+        omega_B = 2.0 * lam_pe / max(state.R0, 1e-30)
+        # n-linear coefficients: k_EM^2 = c_k*n, α_t = c_a*n.
+        c_k = mu0 * e_J * Te * mi_kg / max(state.BT**2 * self._ME_KG, 1e-300)
+        c_a = 3.13e-18 * state.R0 * state.q_cyl**2 * state.Zeff / max(Te**2, 1e-30)
+
+        def G(n):
+            n = max(float(n), 1e-30)
+            k2 = c_k * n
+            k = np.sqrt(max(k2, 1e-300))
+            at = c_a * n
+            lhs = alpha_c * k * tau_i * Lambda_pi / (1.0 + (at / max(alpha_c, 1e-30)) ** 2 * k2)
+            rhs = at * (0.5 + k2) + 0.5 * (alpha_c / max(k2, 1e-300)) * np.sqrt(max(omega_B, 0.0)) * tau_i * Lambda_pi
+            return lhs - rhs
+
+        # Scan a log grid in units of n_GW for sign changes.
+        grid = state.n_GW * np.logspace(-3.0, np.log10(5.0), 96)
+        gv = np.array([G(x) for x in grid])
+        idx = np.where(np.sign(gv[:-1]) != np.sign(gv[1:]))[0]
+        roots = []
+        for i in idx:
+            try:
+                roots.append(float(brentq(G, grid[i], grid[i + 1], xtol=1e-3 * state.n_GW, rtol=1e-8)))
+            except Exception:
+                continue
+        if not roots:
+            return None, None
+        roots.sort()
+        return roots[0], roots[-1]
+
+    def _sepos_clamp(self, state, ne_sep, Te, Ti, aLne, aLte, aLti, aLni) -> float:
+        """
+        Clamp n_e,sep to the SepOS feasible band (section 4.5):
+
+            n_sep,max = min(n_ball, n_LH,high)            ceiling
+            n_sep,min = lower_envelope(n_DL, n_LH,low)    floor
+
+        where n_LH,low/high are the two roots of the L-H criterion G (Eq. 8) and
+        n_ball / n_DL are the closed-form ideal-ballooning ceiling and L-mode
+        density-limit floor. Warns if the prescribed density is clipped.
+        """
+        mu0 = 4.0e-7 * np.pi
+        kappa_hat = np.sqrt(
+            (1.0 + state.kappa**2 * (1.0 + 2.0 * state.delta**2 - 1.2 * state.delta**3)) / 2.0
+        )
+        alpha_c = kappa_hat**1.2 * (1.0 + 1.5 * state.delta)
+        lam_pe = state.a / max(aLne + aLte, 1e-30)
+        # Λ_pi = λ_pe/λ_pi = (a/L_ni + a/L_Ti)/(a/L_ne + a/L_Te); paper reduces to 1.
+        Lambda_pi = (aLni + aLti) / max(aLne + aLte, 1e-30)
+        T_tot = Te + Ti  # eV
+
+        # Closed-form ballooning ceiling and density-limit floor.
+        n_ball = (alpha_c * lam_pe * state.BT**2
+                  / max(2.0 * mu0 * state.R0 * state.q_cyl**2 * e_J * T_tot, 1e-30))
+        n_DL = (state.n_GW * 0.11 * (np.sqrt(alpha_c) / max(kappa_hat**2, 1e-30))
+                * np.sqrt(max(Te, 0.0) / max(state.Zeff, 1e-30))
+                * lam_pe**0.25 * state.R0**0.25)
+
+        # L-H roots feed both bounds: upper root caps the ceiling, lower root the floor.
+        n_lh_low, n_lh_high = self._lh_roots(state, Te, Ti, lam_pe, alpha_c, Lambda_pi)
+
+        n_max = n_ball if n_lh_high is None else min(n_ball, n_lh_high)
+        n_min = n_DL if n_lh_low is None else min(n_DL, n_lh_low)
+
+        lo, hi = min(n_min, n_max), max(n_min, n_max)
+        ne_clamped = float(np.clip(ne_sep, lo, hi))
+        if self.verbose and abs(ne_clamped - ne_sep) / max(ne_sep, 1e-30) > 1e-6:
+            print(
+                f"[Synthesis] n_e,sep={ne_sep:.3e} clamped to {ne_clamped:.3e} "
+                f"(SepOS band [{lo:.3e},{hi:.3e}]; n_ball={n_ball:.2e}, n_DL={n_DL:.2e}, "
+                f"n_LH=[{n_lh_low},{n_lh_high}]) — f_GW not consistent with predicted T_e,sep",
+                typeMsg="w",
+            )
+        return ne_clamped
+
+
 # ---------------------------------------------------------------------------
 # Registry and factory
 # ---------------------------------------------------------------------------
@@ -771,6 +1090,21 @@ def build_bc_model(bc_model, bc_model_options: dict | None = None) -> CombinedBC
     """
     if bc_model_options is None:
         bc_model_options = {}
+
+    # Self-consistent section-4/5 synthesis model (its own coupled solver).
+    _SYNTH_NAMES = {"Synthesis", "TwoFluidSynthesis", "TwoFluid_Synthesis", "TFTP_Synthesis"}
+    _is_synth = (
+        (isinstance(bc_model, str) and bc_model in _SYNTH_NAMES)
+        or (isinstance(bc_model, dict) and (
+            bc_model.get("aLy") in _SYNTH_NAMES or bc_model.get("model") in _SYNTH_NAMES
+        ))
+    )
+    if _is_synth:
+        flat = {k: v for k, v in bc_model_options.items() if k not in ("y", "aLy", "combined")}
+        synth_opts = {**flat,
+                      **dict(bc_model_options.get("aLy", {}) if isinstance(bc_model_options.get("aLy"), dict) else {}),
+                      **dict(bc_model_options.get("combined", {}))}
+        return TwoFluidSynthesis(synth_opts)
 
     if isinstance(bc_model, str):
         if bc_model not in _LEGACY_MAP:

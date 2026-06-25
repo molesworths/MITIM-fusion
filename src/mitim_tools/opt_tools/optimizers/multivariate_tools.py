@@ -373,27 +373,48 @@ def simple_relaxation( flux_residual_evaluator, x_initial, bounds=None, solver_o
     return x_best, y_history, x_history, metric_history
 
 def _sr_step(x, Q, QT, relax, dx_max, dx_max_abs = None, dx_min_abs = None, threshold_zero_flux_issue=1e-10, bounds=None, thr_bounds=1e-4):
-    
+
+    # Simple relaxation is a square flux-match Picard step: it pairs each gradient
+    # DV with its co-located flux residual. When the design vector carries extra
+    # DVs without a flux partner (e.g. the LCFS soft-prior aLy DVs appended after
+    # the interior knots, lcfs_bc_model.md section 6) the system is no longer
+    # square. We relax only the flux-paired columns (the first Q.shape[-1]) and
+    # leave the trailing DVs at their guess value; they are explored jointly by
+    # the other acquisition optimizers, and the soft-prior penalty is already
+    # carried by the scalar metric used to rank candidates.
+    n_flux = Q.shape[-1]
+    full_dim = x.shape[-1]
+
+    xf = x[..., :n_flux]
+    relax_f = relax[..., :n_flux] if relax.shape[-1] == full_dim else relax
+
     # Calculate step in gradient (if target > transport, dx>0 because I want to increase gradients)
-    dx = relax * (QT - Q) / (Q**2 + QT**2).clamp(min=threshold_zero_flux_issue) ** 0.5
+    dx = relax_f * (QT - Q) / (Q**2 + QT**2).clamp(min=threshold_zero_flux_issue) ** 0.5
 
     # Prevent big steps - Clamp to the max step (with the right sign)
     ix = dx.abs() > dx_max
     dx[ix] = dx_max * (dx[ix] / dx[ix].abs())
 
     # Define absolute step (Note for PRF: abs() was added by me, I think it performs better that way!)
-    x_step = dx * x.abs()
+    step_f = dx * xf.abs()
 
     # Absolute steps limits
     if dx_max_abs is not None:
-        ix = x_step.abs() > dx_max_abs
-        direction = torch.nan_to_num(x_step[ix] / x_step[ix].abs(), nan=1.0)
-        x_step[ix] = dx_max_abs * direction
-    
+        ix = step_f.abs() > dx_max_abs
+        direction = torch.nan_to_num(step_f[ix] / step_f[ix].abs(), nan=1.0)
+        step_f[ix] = dx_max_abs * direction
+
     if dx_min_abs is not None:
-        ix = x_step.abs() < dx_min_abs
-        direction = torch.nan_to_num(x_step[ix] / x_step[ix].abs(), nan=1.0)
-        x_step[ix] = dx_min_abs * direction
+        ix = step_f.abs() < dx_min_abs
+        direction = torch.nan_to_num(step_f[ix] / step_f[ix].abs(), nan=1.0)
+        step_f[ix] = dx_min_abs * direction
+
+    # Embed the flux-paired step into the full-width step (trailing DVs unchanged)
+    if n_flux == full_dim:
+        x_step = step_f
+    else:
+        x_step = torch.zeros_like(x)
+        x_step[..., :n_flux] = step_f
 
     # Update
     x_new = x + x_step
