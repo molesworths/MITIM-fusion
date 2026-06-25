@@ -8,6 +8,7 @@ from functools import partial
 from mitim_modules.powertorch.utils import TRANSPORTtools
 from mitim_tools.misc_tools import IOtools
 from mitim_modules.powertorch import STATEtools
+from mitim_tools.opt_tools import STRATEGYtools
 from mitim_tools.opt_tools.utils import BOgraphics, SAMPLINGtools
 from mitim_tools.misc_tools.LOGtools import printMsg as print
 from IPython import embed
@@ -532,6 +533,98 @@ def enable_mtanh_feasibility_constraint(portals_obj, safety_margin=1e-10):
 
     print(
         "\t- [mtanh_feasibility_constraint] Enabled dynamic nonlinear mtanh feasibility constraints",
+        typeMsg="i",
+    )
+
+    return True
+
+
+def monotonicity_inequality_constraints(portals_obj, eps=0.0):
+    """
+    Build BoTorch *linear* inequality constraints enforcing monotonicity between
+    consecutive interior ``{ch}_aLy{i}`` knot DVs of the same channel:
+
+        x[i_hi] - x[i_lo] >= eps
+
+    BoTorch expresses each constraint as ``sum(coeff * X[idx]) >= rhs``, so a
+    pair (i_lo, i_hi) maps to ``([i_lo, i_hi], [-1.0, 1.0], eps)``. Pairs come
+    from the shared ``build_monotonicity_pairs`` helper (the same source the wLM
+    soft-monotonicity QP uses), which already excludes ``_lcfs`` boundary DVs.
+
+    Constraints are written in the physical DV coordinates the BO optimizer
+    searches (``bounds_mod`` is not normalized), so no rescaling is needed.
+
+    ``eps`` defaults to 0.0 (hard monotonicity); set a small negative value to
+    allow a slight, soft violation.
+
+    Returns
+    -------
+    list[tuple[torch.Tensor, torch.Tensor, float]]
+        BoTorch ``inequality_constraints`` payload (empty if no interior pairs).
+    """
+    dv_names = portals_obj.optimization_options["problem_options"]["dvs"]
+    pairs = STRATEGYtools.build_monotonicity_pairs(dv_names)
+
+    constraints = []
+    for (i_lo, i_hi) in pairs:
+        constraints.append(
+            (
+                torch.tensor([i_lo, i_hi], dtype=torch.long),
+                torch.tensor([-1.0, 1.0], dtype=torch.double),
+                float(eps),
+            )
+        )
+
+    return constraints
+
+
+def monotonicity_inequality_constraints_builder(portals_obj, eps=0.0):
+    """
+    Return a callable that rebuilds the linear monotonicity constraints at
+    runtime (so they track the current DV ordering each optimization iteration).
+    """
+
+    def _build_constraints(_fun=None):
+        return monotonicity_inequality_constraints(portals_obj, eps=eps)
+
+    return _build_constraints
+
+
+def enable_monotonicity_constraint(portals_obj, enabled=True, eps=0.0):
+    """
+    Optionally attach linear monotonicity constraints between consecutive
+    interior ``{ch}_aLy{i}`` DVs to the BoTorch acquisition optimizer.
+
+    This is opt-in: it does nothing unless ``enabled`` is True (and there is at
+    least one interior knot pair to constrain).
+
+    Returns
+    -------
+    bool
+        True when constraints were attached, False otherwise.
+    """
+    if not enabled:
+        return False
+
+    constraints = monotonicity_inequality_constraints(portals_obj, eps=eps)
+    if len(constraints) == 0:
+        print(
+            "\t- [monotonicity_constraint] No interior aLy knot pairs found; nothing to constrain",
+            typeMsg="w",
+        )
+        return False
+
+    acq_opts = portals_obj.optimization_options["acquisition_options"]
+    optimizer_options = acq_opts.setdefault("optimizer_options", {})
+    botorch_options = optimizer_options.setdefault("botorch", {})
+    botorch_options["inequality_constraints"] = constraints
+    botorch_options["inequality_constraints_builder"] = monotonicity_inequality_constraints_builder(
+        portals_obj,
+        eps=eps,
+    )
+
+    print(
+        f"\t- [monotonicity_constraint] Enabled {len(constraints)} linear aLy monotonicity constraints",
         typeMsg="i",
     )
 

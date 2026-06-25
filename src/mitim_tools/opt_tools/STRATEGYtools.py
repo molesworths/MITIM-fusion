@@ -365,6 +365,53 @@ def _scalarized_objective_with_X(optimization_object, Y, X=None):
     return optimization_object.scalarized_objective(Y)
 
 
+def build_monotonicity_pairs(dv_names):
+    """
+    Build consecutive-index pairs (i_lo, i_hi) within each physical channel,
+    ordered by radial/knot position, for the monotonicity relation
+    ``x[i_hi] - x[i_lo] >= 0``.
+
+    Pairs are formed ONLY between consecutive *interior* knot DVs of the same
+    channel. LCFS boundary DVs (name suffix ``_lcfs``) are excluded -- they are
+    single, soft-priored separatrix gradients, not part of any radial chain.
+
+    Interior DV names follow either ``{channel}_aLy{pos}`` / ``{channel}_d{pos}``
+    (current parameterizers) or the legacy ``aL{channel}_{pos}`` form; all are
+    recognized. ``dv_names`` is the ordered list of DV names (e.g.
+    ``list(self.bounds.keys())``), and the returned indices are positions into it.
+
+    This is the single source of truth shared by the wLM soft-monotonicity QP
+    (``MITIM_wLM._build_monotonicity_pairs``) and the optional BO linear
+    monotonicity constraints.
+    """
+    patterns = [
+        re.compile(r"^(?P<channel>.+)_aLy(?P<position>\d+)$"),   # {ch}_aLy{i}
+        re.compile(r"^(?P<channel>.+)_d(?P<position>\d+)$"),      # {ch}_d{i} (dy knots)
+        re.compile(r"^aL(?P<channel>.+)_(?P<position>\d+)$"),     # legacy aL{ch}_{i}
+    ]
+
+    channel_groups = {}
+    for idx, name in enumerate(dv_names):
+        sname = str(name)
+        if sname.endswith("_lcfs"):
+            continue  # exclude LCFS boundary DVs from monotonicity
+        for pattern in patterns:
+            m = pattern.match(sname)
+            if m:
+                channel_groups.setdefault(m.group("channel"), []).append(
+                    (int(m.group("position")), idx)
+                )
+                break
+
+    pairs = []
+    for channel, entries in channel_groups.items():
+        entries.sort(key=lambda e: e[0])
+        for k in range(len(entries) - 1):
+            pairs.append((entries[k][1], entries[k + 1][1]))
+
+    return pairs
+
+
 # Main BO class that performs optimization
 class MITIM_BO:
     def __init__(
@@ -1981,33 +2028,7 @@ class MITIM_wLM(MITIM_BO):
         ``aL{channel}_{pos}`` form; both are recognized. Derived from
         self.bounds (DV order) rather than assumed.
         """
-        dv_names = list(self.bounds.keys())
-        patterns = [
-            re.compile(r"^(?P<channel>.+)_aLy(?P<position>\d+)$"),   # {ch}_aLy{i}
-            re.compile(r"^(?P<channel>.+)_d(?P<position>\d+)$"),      # {ch}_d{i} (dy knots)
-            re.compile(r"^aL(?P<channel>.+)_(?P<position>\d+)$"),     # legacy aL{ch}_{i}
-        ]
-
-        channel_groups = {}
-        for idx, name in enumerate(dv_names):
-            sname = str(name)
-            if sname.endswith("_lcfs"):
-                continue  # exclude LCFS boundary DVs from monotonicity
-            for pattern in patterns:
-                m = pattern.match(sname)
-                if m:
-                    channel_groups.setdefault(m.group("channel"), []).append(
-                        (int(m.group("position")), idx)
-                    )
-                    break
-
-        pairs = []
-        for channel, entries in channel_groups.items():
-            entries.sort(key=lambda e: e[0])
-            for k in range(len(entries) - 1):
-                pairs.append((entries[k][1], entries[k + 1][1]))
-
-        return pairs
+        return build_monotonicity_pairs(list(self.bounds.keys()))
 
     # ------------------------------------------------------------------
     # mu_F, Sigma_F (diagonal), J = d(mu_F)/d(x_int)

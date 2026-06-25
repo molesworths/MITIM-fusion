@@ -35,10 +35,16 @@ def optimize_function(fun, optimization_params = {}, writeTrajectory=False):
     sequential_q = optimization_params.get("sequential_q",True) # Not really relevant for q=1, but recommendation from BoTorch team for q>1
     nonlinear_ineq_builder = optimization_params.get("nonlinear_inequality_constraints_builder", None)
     nonlinear_ineq_constraints = optimization_params.get("nonlinear_inequality_constraints", None)
+    linear_ineq_builder = optimization_params.get("inequality_constraints_builder", None)
+    linear_ineq_constraints = optimization_params.get("inequality_constraints", None)
 
     if callable(nonlinear_ineq_builder):
         # Recompute constraints at runtime so evolving BCs are reflected each iteration.
         nonlinear_ineq_constraints = nonlinear_ineq_builder(fun)
+
+    if callable(linear_ineq_builder):
+        # Recompute at runtime so the constraints track the current DV ordering.
+        linear_ineq_constraints = linear_ineq_builder(fun)
     
     options = {
         "sample_around_best": True,
@@ -78,6 +84,11 @@ def optimize_function(fun, optimization_params = {}, writeTrajectory=False):
             f"\t\t- Applying {len(nonlinear_ineq_constraints)} nonlinear inequality constraints",
             typeMsg="i",
         )
+    if linear_ineq_constraints is not None and len(linear_ineq_constraints) > 0:
+        print(
+            f"\t\t- Applying {len(linear_ineq_constraints)} linear inequality constraints",
+            typeMsg="i",
+        )
 
     optimize_kwargs = {
         "acq_function": fun_opt,
@@ -91,6 +102,9 @@ def optimize_function(fun, optimization_params = {}, writeTrajectory=False):
 
     if nonlinear_ineq_constraints is not None:
         optimize_kwargs["nonlinear_inequality_constraints"] = nonlinear_ineq_constraints
+
+    if linear_ineq_constraints is not None and len(linear_ineq_constraints) > 0:
+        optimize_kwargs["inequality_constraints"] = linear_ineq_constraints
 
     with IOtools.timer(name = "\n\t- Optimization"):
         try:
