@@ -1331,7 +1331,12 @@ class SplineMtanh(ParameterBase):
     _W1_BOUNDS = (1e-2, 0.15)
     # r = log(w2/w1) <= 0 enforces w2 <= w1; lower bound caps w1/w2 ratio at 10.
     _R_BOUNDS = (float(np.log(0.1)), 0.0)
-    _C_BOUNDS = (0.9, 1.0)
+    # c may exceed 1: with c>1 the tanh *tail* (not the linear background m)
+    # carries a steep near-separatrix gradient, so a flat interior + sharp
+    # aLy(1) is representable with a small, feasible m. Capping c at 1.0 forced
+    # m to absorb the LCFS gradient (m>>10, infeasible) and smeared that
+    # steepness across the interior (the ne 327% failure mode).
+    _C_BOUNDS = (0.8, 1.1)
 
     def __init__(self, options: Dict[str, Any]):
         super().__init__(options)
@@ -1354,6 +1359,11 @@ class SplineMtanh(ParameterBase):
         self.fit_trf_diff_step = float(options.get('fit_trf_diff_step', 5e-2))
         # Single pointwise acceptance criterion: max relative error across all knot points.
         self.fit_max_rel_error = float(options.get('fit_max_rel_error', 2e-2))
+        # A warm-start solve whose interior residual is already below this is
+        # accepted immediately (one least_squares call) without the cold c-seed
+        # sweep. This keeps the hot path cheap: only a cold profile, or a warm
+        # solve that landed on the poor-basin "ridge" (> this), pays the sweep.
+        self.fit_warm_accept_rel = float(options.get('fit_warm_accept_rel', 0.30))
         # Fit strategy: with m,b eliminated analytically from the LCFS (y(1),aLy(1))
         # BCs, the residual surface over {log_A,c,log_w1,r} is low-dimensional and
         # effectively unimodal for monotone pedestal gradients. The warm-started
@@ -1466,9 +1476,11 @@ class SplineMtanh(ParameterBase):
         # bound (r <= 0), so no ratio penalty is needed.
         v_m_lo  = max(0.0, 0.01 - m)                         # m in [0.01, 10]
         v_m_hi  = max(0.0, m - 10.0)
-        # C1: u'(x) > 0 on [x0, 1]; with delta <= 0 the binding point is x = x0,
-        # so require 1 - delta*(x0 - c) > 0.
-        v_c1 = max(0.0, delta * (self.x0 - c) - 1.0)
+        # C1: u'(x) > 0 on [x0, 1]. u'(x) = (1 - delta*(x - c))/w with w>0, so the
+        # sign follows g(x) = 1 - delta*(x - c), linear in x; its minimum over
+        # [x0, 1] is at an endpoint. With c<=1 the binding end is x0, but for c>1
+        # the x=1 end can bind, so require g>0 at BOTH endpoints.
+        v_c1 = max(0.0, delta * (self.x0 - c) - 1.0, delta * (1.0 - c) - 1.0)
 
         violation = np.array([v_m_lo, v_m_hi, v_c1], dtype=float)
 
@@ -1511,6 +1523,15 @@ class SplineMtanh(ParameterBase):
         fixed_starts = [
             np.array([np.log(0.05), 0.97, np.log(0.05), np.log(0.4)], dtype=float),
             np.array([np.log(0.5),  0.95, np.log(0.10), np.log(0.5)], dtype=float),
+            # c>1 seeds: tanh tail carries a steep LCFS gradient with small m.
+            # Essential because the local TRF will not cross c=1 from the starts
+            # above on its own (the c>1 optimum sits in a separate basin). Spread
+            # over (c, w1, A) so at least one lands in the steep-LCFS basin across
+            # the range of (interior, aLy(1)) tuples the optimizer proposes.
+            np.array([np.log(0.3),  1.03, np.log(0.02), np.log(0.5)], dtype=float),
+            np.array([np.log(0.5),  1.07, np.log(0.04), np.log(0.4)], dtype=float),
+            np.array([np.log(1.0),  1.12, np.log(0.06), np.log(0.3)], dtype=float),
+            np.array([np.log(2.0),  1.18, np.log(0.08), np.log(0.2)], dtype=float),
         ]
 
         # Generate additional multistart points by interpolating between fixed_starts
@@ -1533,7 +1554,13 @@ class SplineMtanh(ParameterBase):
         best_theta = None
 
         for theta0 in candidates:
-            if not self._is_feasible_theta(theta0, y_bc, aLy_bc):
+            # Skip only starts that reconstruct to non-finite physics. A start
+            # that is merely *infeasible* (e.g. m>10 at a c>1 seed before A is
+            # optimized) is kept: the feasibility penalty in residual_fn pulls it
+            # into the feasible region. Filtering on feasibility here would
+            # discard exactly the steep-LCFS c>1 seeds we need.
+            phys0, _ = self._to_physical_projected(theta0, y_bc, aLy_bc)
+            if not np.all(np.isfinite(np.asarray(phys0, dtype=float))):
                 continue
             try:
                 result = least_squares(
@@ -1581,61 +1608,101 @@ class SplineMtanh(ParameterBase):
         aLy_bc: float,
         p0: Optional[np.ndarray] = None,
     ) -> Dict[str, float]:
-        # (a/Ly)(1) is satisfied exactly by construction (m elimination), so we
-        # only fit the interior knot observations here.
+        """Locate the mtanh shape {log_A, c, log_w1, r} that fits the interior aLy knots.
+
+        Reconstructed 8pm-Jun-26 "warm-accept" form (recovered from the Jun-26
+        session transcript; this is the fit path that produced the flux-matched
+        global_gp run). aLy(1) is satisfied exactly by m,b elimination in _resolve,
+        so only the interior knots are fit here, each candidate scored on the
+        eliminated-m interior residual. A warm start (cache/IDW/last-theta) gets a
+        single TRF solve and is accepted immediately unless it lands on the poor
+        "ridge" basin (interior max-rel > fit_warm_accept_rel); only then does the
+        cold c-seed sweep run. The c-seeds span the gradient-peak basin, plateau,
+        and gentle-edge (low-c) regime at two widths to bracket steep pedestals,
+        stopping as soon as a seed clears the 2% acceptance (fit_max_rel_error).
+        """
         x_fit = np.asarray(x_k, dtype=float)
         aLy_fit = np.asarray(aLy_k, dtype=float)
         scale = np.maximum(aLy_fit, 1e-3)
 
-        def _residuals(p: np.ndarray) -> np.ndarray:
-            phys, violation = self._to_physical_projected(p, y_bc, aLy_bc)
+        bnds = self._global_bounds()
+        lo = np.array([b[0] for b in bnds], dtype=float)
+        hi = np.array([b[1] for b in bnds], dtype=float)
+
+        def _residuals(p4: np.ndarray) -> np.ndarray:
+            phys, violation = self._to_physical_projected(p4, y_bc, aLy_bc)
             A, D0, delta, m, c, b = phys
             y = self._y_mtanh(x_fit, A, D0, delta, m, c, b)
             dydx = self._dydx_mtanh(x_fit, A, D0, delta, m, c)
             y_safe = np.where(np.abs(y) < self._Y_FLOOR, self._Y_FLOOR, y)
-            aLy_model = -dydx / y_safe
-            res_data = (aLy_model - aLy_fit) / scale
+            res_data = (-dydx / y_safe - aLy_fit) / scale
             penalty = np.sqrt(self.fit_penalty_weight) * violation
             return np.concatenate([res_data, penalty])
 
-        def _accept(p: np.ndarray) -> bool:
-            phys = self._to_physical(p, y_bc, aLy_bc)
-            if phys is None:
-                return False
+        def _interior_maxrel(theta4: np.ndarray) -> float:
+            phys, _ = self._to_physical_projected(theta4, y_bc, aLy_bc)
             A, D0, delta, m, c, b = phys
             y = self._y_mtanh(x_fit, A, D0, delta, m, c, b)
             dydx = self._dydx_mtanh(x_fit, A, D0, delta, m, c)
             y_safe = np.where(np.abs(y) < self._Y_FLOOR, self._Y_FLOOR, y)
-            model = -dydx / y_safe
-            rel = np.abs(model - aLy_fit) / np.maximum(np.abs(aLy_fit), 1e-3)
-            return bool(np.max(rel) <= self.fit_max_rel_error)
+            rel = np.abs(-dydx / y_safe - aLy_fit) / np.maximum(np.abs(aLy_fit), 1e-3)
+            return float(np.max(rel))
 
-        # Hot-path: a feasible warm start (cache/IDW/last-theta seed) gets a single
-        # bounded TRF solve. Off-family targets are *not* force-fit with multistart
-        # here — the residual is left for the cheap spline superposition in
-        # _evaluate_once. The multistart is reserved for the cold first call per
-        # profile (no warm start yet), keeping thousands of resolves fast.
-        if p0 is not None and self._is_feasible_theta(p0, y_bc, aLy_bc):
-            bounds = self._global_bounds()
-            lo = np.array([b[0] for b in bounds], dtype=float)
-            hi = np.array([b[1] for b in bounds], dtype=float)
-            p0_arr = np.minimum(np.maximum(np.asarray(p0, dtype=float).reshape(-1)[:4], lo), hi)
+        def _solve_from(s: np.ndarray) -> Optional[np.ndarray]:
             try:
-                fit = least_squares(
-                    _residuals, p0_arr, method='trf', bounds=(lo, hi),
+                return np.asarray(least_squares(
+                    _residuals, np.minimum(np.maximum(s, lo), hi), method='trf', bounds=(lo, hi),
                     ftol=self.fit_trf_ftol, gtol=self.fit_trf_gtol, xtol=self.fit_trf_xtol,
                     diff_step=self.fit_trf_diff_step, x_scale='jac', max_nfev=self.fit_max_nfev,
-                )
-                popt = np.asarray(fit.x, dtype=float)
+                ).x, dtype=float)
             except Exception:
-                popt = self._fit_multistart_trf(_residuals, y_bc, aLy_bc, p0=p0, accept_fn=_accept)
-        else:
-            popt = self._fit_multistart_trf(_residuals, y_bc, aLy_bc, p0=p0, accept_fn=_accept)
+                return None
+
+        best_theta4 = None
+        best_rel = np.inf
+
+        # Hot path: a warm start (cache/IDW/last-theta) gets a single solve. Most
+        # resolves in a solve are small perturbations of a prior fit, so this is the
+        # common case. Accept immediately unless it landed on the poor "ridge"
+        # basin (residual > fit_warm_accept_rel), which triggers the cold sweep.
+        if p0 is not None:
+            cand = _solve_from(np.asarray(p0, dtype=float).reshape(-1)[:4])
+            if cand is not None:
+                best_theta4, best_rel = cand, _interior_maxrel(cand)
+                if best_rel <= self.fit_warm_accept_rel:
+                    return {'log_A': float(cand[0]), 'c': float(cand[1]),
+                            'log_w1': float(cand[2]), 'r': float(cand[3])}
+
+        # Cold / ridge-escape sweep: c-seeds spanning the gradient-peak basin, the
+        # plateau, and the gentle-edge (low-c) regime, each at two widths (both are
+        # needed to bracket steep-pedestal channels). This is the only expensive
+        # path, but it fires only on a genuinely cold profile (no warm start) or a
+        # ridge-trapped warm solve -- rare, because _last_theta_guess/cache make the
+        # 1-solve warm path the common case in a solve. Stop once a seed clears 2%.
+        c_lo, c_hi = self._C_BOUNDS
+        cold_seeds = [
+            np.array([np.log(0.3), c0, np.log(w10), np.log(0.4)], dtype=float)
+            for c0 in np.linspace(max(0.86, c_lo), min(1.06, c_hi), 6)
+            for w10 in (0.03, 0.08)
+        ]
+        for s in cold_seeds:
+            cand = _solve_from(s)
+            if cand is None:
+                continue
+            rel = _interior_maxrel(cand)
+            if rel < best_rel:
+                best_theta4, best_rel = cand, rel
+            if best_rel <= self.fit_max_rel_error:
+                break
+
+        theta4 = best_theta4 if best_theta4 is not None else np.array(
+            [np.log(0.5), 0.95, np.log(0.10), np.log(0.5)], dtype=float)
+
         return {
-            'log_A': float(popt[0]),
-            'c': float(popt[1]),
-            'log_w1': float(popt[2]),
-            'r': float(popt[3]),
+            'log_A': float(theta4[0]),
+            'c': float(theta4[1]),
+            'log_w1': float(theta4[2]),
+            'r': float(theta4[3]),
         }
 
     def _verify_resolve(
