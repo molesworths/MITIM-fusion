@@ -83,19 +83,26 @@ class powerstate_edge(powerstate):
         ("neutral_model_options",       {}),
         ("elm_model",                   "Null"),
         ("elm_model_options",           {}),
-        ("edge_uq_enable",              False),
-        ("edge_uq_calib_dir",           None),
-        ("edge_uq_calib_label",         "baseline"),
-        ("edge_uq_scale_factor",        1.0),
-        ("edge_uq_channel_mapping",     None),
         ("defined_on",                  "y"),
         ("use_edge_targets",            True),
-        # Soft-prior LCFS degrees of freedom (lcfs_bc_model.md section 6).
-        # When enabled, the per-channel aLy(1) boundary condition is an optimizer
-        # DV and the BC-model output becomes its prior mean F_y; the residual
-        # R_LCFS,y = (y - F_y)/sigma_y is added analytically (not via a flux GP).
-        ("lcfs_dv",                     True),
-        ("lcfs_sigma",                  {}),
+        # ne-channel flux observable, i.e. how the ne residual is defined:
+        #   "convective" (default) : the ne channel is matched on the convective
+        #       ENERGY flux Ce = (3/2) Te * Ge1E20m2 (MW/m^2). Every predicted
+        #       channel (Qe, Qi, Ce) then shares MW/m^2 units, so the ABSOLUTE
+        #       residual cal - of is a consistent total-power objective.
+        #   "particle" : the ne channel is matched on the raw PARTICLE flux
+        #       Ge1E20m2 (10^20/m^2/s). This de-conflates ne from Te, but the ne
+        #       residual is no longer in energy units, so the objective MUST be made
+        #       dimensionless by normalizing each channel's residual to its target
+        #       (targets_scaled=True, i.e. residuals = (cal-of)/cal) -- otherwise the
+        #       absolute residual mixes MW/m^2 with 10^20/m^2/s. Selecting "particle"
+        #       therefore turns on target-normalized residuals by default.
+        ("ne_flux_channel",             "convective"),
+        # Options forwarded to the torchified rotation model (see
+        # mitim_tools.edge_tools.rotation.calculate_rotation), e.g.
+        # {"K_neo": "sauter"} to add the neoclassical poloidal-flow term to Er.
+        # vgen / imposed-toroidal-rotation (vtor) backends live there too.
+        ("rotation_options",            {}),
     ]
 
     @staticmethod
@@ -209,14 +216,6 @@ class powerstate_edge(powerstate):
             return lst
         self.predicted_channels = _ensure_ne_before_nz(self.predicted_channels)
 
-        # Resolve LCFS aLy DV channels + their stiffness now that channels are known.
-        if self._lcfs_dv_enabled:
-            self.lcfs_dv_channels = list(self.predicted_channels)
-            for ch in self.lcfs_dv_channels:
-                self.lcfs_sigma[ch] = float(
-                    self._lcfs_sigma_opt.get(ch, self._lcfs_sigma_default.get(ch, 0.25))
-                )
-
         # Build parameterizer options after channels and radial controls are known.
         parameterizer_name = evolution_options.get("parameterizer", "spline")
         parameterizer_options_input = evolution_options.get(
@@ -242,6 +241,10 @@ class powerstate_edge(powerstate):
             The order in the P and P_tr (and therefore the source S)
             tensors will be the same as in self.predicted_channels
         '''
+        # Default (ne_flux_channel="convective"): ne is matched on the convective
+        # energy flux Ce = (3/2) Te * Ge1E20m2 (MW/m^2), so every predicted channel
+        # shares MW/m^2 units and the absolute residual cal - of is a consistent
+        # total-power objective.
         self.profile_map = {
             "te": ("QeMWm2", "QeMWm2_tr"),
             "ti": ("QiMWm2", "QiMWm2_tr"),
@@ -257,6 +260,20 @@ class powerstate_edge(powerstate):
             "nZ": "$Q_{conv}$ $\\cdot f_{Z,0}$ ($MW/m^2$)",
             "w0": "$M_T$ ($J/m^2$)",
         }
+
+        # Opt-in (ne_flux_channel="particle"): predict ne from the raw PARTICLE flux
+        # Ge1E20m2 (10^20/m^2/s) instead of the convective-energy wrapper Ce. This
+        # de-conflates ne from Te, but the ne residual is then in particle-flux units
+        # while Qe/Qi are in MW/m^2, so the objective must be target-normalized
+        # (dimensionless) -- see ne_flux_channel and self.targets_normalized, which
+        # portals_edge/CALM consult to divide each channel's residual by its target.
+        self._ne_flux_channel = str(_edge_opts.get("ne_flux_channel", "convective"))
+        self.targets_normalized = (self._ne_flux_channel == "particle")
+        if self._ne_flux_channel == "particle":
+            self.profile_map["ne"] = ("Ge1E20m2", "Ge1E20m2_tr")
+            self.labelsFluxes["ne"] = "$\\Gamma_e$ ($10^{20}/m^2/s$)"
+            print(">> [edge] ne channel = PARTICLE flux (Ge1E20m2), de-conflated from "
+                  "Te; residuals target-normalized (dimensionless)")
 
         # Store control points
 
@@ -334,14 +351,6 @@ class powerstate_edge(powerstate):
         self._neu_model_options    = opts.get("neutral_model_options", {})
         self._elm_model_name       = opts.get("elm_model", "Null")
         self._elm_model_options    = opts.get("elm_model_options", {})
-        self._edge_uq_enable       = bool(opts.get("edge_uq_enable", False))
-        self._edge_uq_calib_dir    = opts.get("edge_uq_calib_dir", None)
-        self._edge_uq_calib_label  = str(opts.get("edge_uq_calib_label", "baseline"))
-        self._edge_uq_scale_factor = float(opts.get("edge_uq_scale_factor", 1.0))
-        self._edge_uq_channel_mapping = opts.get("edge_uq_channel_mapping", None)
-        self._edge_uq_calib        = None
-        self._edge_uq_disabled     = False
-        self._edge_uq_warned       = False
         self._targets_scaled       = False
         self._bc_model_instance    = None
         self._cs_model_instance    = None
@@ -354,20 +363,9 @@ class powerstate_edge(powerstate):
         self.bc_dict_batch         = None
         self.bc_tensors            = None
 
-        # Soft-prior LCFS DV machinery (section 6).
-        self._lcfs_dv_enabled      = bool(opts.get("lcfs_dv", True))
-        self._lcfs_sigma_opt       = dict(opts.get("lcfs_sigma", {}) or {})
-        # Default per-channel stiffness sigma_y: tight on conduction-set aLte,
-        # looser on aLne, loosest on the weakly-modeled aLti (section 6).
-        self._lcfs_sigma_default   = {"te": 0.5, "ne": 0.5, "ti": 0.5}
-        # Channels carrying an LCFS aLy DV (set once predicted_channels known).
-        self.lcfs_dv_channels      = []
-        # Prior means F_y per channel: {ch: (batch,) tensor of model aLy(1)}.
-        self.lcfs_prior            = {}
-        # Per-channel stiffness sigma_y (scalar floats).
-        self.lcfs_sigma            = {}
-        # Last LCFS DV slice routed in from X: (batch, n_lcfs) tensor.
-        self.X_lcfs                = None
+        # Rotation model options (analytic / vgen backends, imposed vtor); see
+        # mitim_tools.edge_tools.rotation.
+        self._rotation_options     = dict(opts.get("rotation_options", {}) or {})
 
     def _bind_parameterizer(self, parameterizer_name, parameterizer_options):
         """Instantiate and bind the configured parameterizer model."""
@@ -382,11 +380,13 @@ class powerstate_edge(powerstate):
             self.parameterizer = _parameterizers_mod.Mtanh(self._parameterizer_options)
         elif self._parameterizer_name in {"SplineMtanh", "spline_mtanh", "mtanh_spline", "MtanhSpline"}:
             self.parameterizer = _parameterizers_mod.SplineMtanh(self._parameterizer_options)
+        elif self._parameterizer_name in {"SplineMtanhAnalytic", "spline_mtanh_analytic",
+                                          "mtanh_spline_analytic", "MtanhSplineAnalytic"}:
+            self.parameterizer = _parameterizers_mod.SplineMtanhAnalytic(self._parameterizer_options)
         else:
             raise ValueError(
                 f"[powerstate_edge] Unknown parameterizer {self._parameterizer_name}"
             )
-
 
     # ------------------------------------------------------------------
     # Main tools
@@ -481,13 +481,6 @@ class powerstate_edge(powerstate):
 
         self.X_to_dict(X)
 
-        # Section 6: route the LCFS aLy DVs into the aLy(1) boundary condition so
-        # that the optimizer directly controls the separatrix gradient. The
-        # BC-model output (captured as self.lcfs_prior) remains only as the soft
-        # prior target. The override keeps the autograd path X -> aLy(1) -> y(rho)
-        # so that dR_int/dy_lcfs is available by chain rule.
-        self._override_lcfs_bc_with_dv()
-
         use_tensor_bcs = isinstance(self.bc_tensors, dict) and len(self.bc_tensors) > 0
 
         if use_tensor_bcs:
@@ -562,8 +555,104 @@ class powerstate_edge(powerstate):
             ).clamp(min=0.0)
 
 
-        # Keep density scale lengths consistent with updated ni / nZ profiles and BCs.
+        # Close quasineutrality on the main ion, then keep density scale lengths
+        # consistent with the updated ni / nZ profiles and BCs.
+        self._enforce_quasineutrality()
         self._refresh_density_scale_lengths()
+
+    def _impurity_charge_moments(self):
+        """Impurity charge density Σ_z z·n_z and Σ_z z²·n_z, generalized over the
+        number of charge states.
+
+        Both moments are taken from the SAME source so that quasineutrality and Zeff
+        cannot disagree:
+          * ``plasma['nz_all']`` (batch, rho, nZ+1) when a charge-state model produced
+            a real solution -> Z+1 stages (index 0 = neutral, contributes nothing).
+          * otherwise the single fully-stripped ``ni[..., impurityPosition]`` at Z_imp
+            -> one stage.
+        Returns (charge, z2) as (batch, rho) tensors, or None if unavailable.
+        """
+        p = self.plasma
+        if ("ni" not in p) or ("ions_set_Zi" not in p):
+            return None
+
+        ni = p["ni"]
+        imp = self.impurityPosition
+        if not (0 <= imp < ni.shape[-1]):
+            return None
+
+        nz_all = p.get("nz_all", None)
+        real_cs = (
+            str(self._cs_model_name).lower() not in ("null", "none")
+            and nz_all is not None
+            and nz_all.dim() == 3
+            and nz_all.shape[0] == ni.shape[0]
+            and nz_all.shape[1] == ni.shape[1]
+        )
+
+        if real_cs:
+            z = torch.arange(nz_all.shape[-1], dtype=nz_all.dtype, device=nz_all.device)
+            return (nz_all * z).sum(dim=-1), (nz_all * z**2).sum(dim=-1)
+
+        Zi = p["ions_set_Zi"]
+        Z_imp = (Zi[:, imp].unsqueeze(-1) if Zi.dim() == 2 else Zi[imp])
+        return Z_imp * ni[..., imp], Z_imp**2 * ni[..., imp]
+
+    def _enforce_quasineutrality(self):
+        """Close Σ_s Z_s n_s = n_e on the main ion and refresh Zeff from the result.
+
+        Runs after EITHER source of the impurity density -- the parameterizer
+        (aLnZ -> nZ) or the charge-state model (nz_all) -- so the two paths cannot
+        drift apart. A no-op at baseline: the experimental state already satisfies QN,
+        and ``scaleIonDensities`` preserves it exactly under an ne scan.
+        """
+        p = self.plasma
+        if ("ni" not in p) or ("ne" not in p) or ("ions_set_Zi" not in p):
+            return
+
+        ni, ne, Zi = p["ni"], p["ne"], p["ions_set_Zi"]
+        if ni.dim() != 3 or ne.dim() != 2:
+            return
+
+        Zi_b = Zi.unsqueeze(0).expand(ni.shape[0], -1) if Zi.dim() == 1 else Zi
+        if Zi_b.shape[0] != ni.shape[0] or Zi_b.shape[-1] != ni.shape[-1]:
+            return
+
+        main = int(getattr(self, "_main_ion_index", 0))
+        imp = self.impurityPosition
+        if not (0 <= main < ni.shape[-1]) or main == imp:
+            return
+
+        moments = self._impurity_charge_moments()
+        if moments is None:
+            return
+        imp_charge, imp_z2 = moments
+
+        # Everything that is neither the main ion nor the impurity keeps its single Z.
+        other_charge = torch.zeros_like(ne)
+        other_z2 = torch.zeros_like(ne)
+        for s in range(ni.shape[-1]):
+            if s in (main, imp):
+                continue
+            Zs = Zi_b[:, s].unsqueeze(-1)
+            other_charge = other_charge + Zs * ni[..., s]
+            other_z2 = other_z2 + Zs**2 * ni[..., s]
+
+        Z_main = Zi_b[:, main].unsqueeze(-1)
+        n_main = (ne - imp_charge - other_charge) / Z_main.clamp(min=1e-30)
+        if n_main.min().item() < 0.0:
+            print(
+                f"[powerstate_edge] Quasineutrality gives n_main < 0 "
+                f"(min={n_main.min().item():.3e}); impurity charge exceeds n_e. Clamping.",
+                typeMsg="w",
+            )
+        n_main = torch.nan_to_num(n_main, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        ni[..., main] = n_main
+
+        p["Zeff"] = torch.nan_to_num(
+            (Z_main**2 * n_main + other_z2 + imp_z2) / ne.clamp(min=1e-30),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
 
     def _refresh_density_scale_lengths(self):
         """
@@ -719,27 +808,6 @@ class powerstate_edge(powerstate):
         folder_main = solver_options_use.get("folder", None)
         namingConvention = solver_options_use.get("namingConvention", "powerstate_sr_ev")
 
-        # Interior knot-DV width (excludes the LCFS aLy DVs). The flux-match
-        # relaxation only moves interior gradient DVs — the LCFS boundary DVs
-        # have no flux residual and are held fixed at their base value here
-        # (they are optimized later as soft-priored DVs in the main loop).
-        widths = self.parameterizer.n_params_per_profile
-        if np.isscalar(widths):
-            widths = [int(widths)] * len(self.predicted_channels)
-        elif len(widths) == 1 and len(self.predicted_channels) > 1:
-            widths = list(widths) * len(self.predicted_channels)
-        n_interior = int(sum(int(w) for w in widths))
-
-        # Optional per-iteration LCFS DV schedule (set by initialization to inject
-        # variation in the LCFS DVs across the relaxation trajectory, so the GP
-        # learns flux sensitivity to them — otherwise every initial-training
-        # point sits at the prior and R_LCFS=0 never nudges those DVs). When set,
-        # it overrides the constant lcfs_fixed below: row `cont` is used for the
-        # cont-th evaluation and the same row anchors that trajectory point.
-        lcfs_schedule = getattr(self, "_lcfs_init_schedule", None)
-        if lcfs_schedule is not None:
-            lcfs_schedule = torch.as_tensor(lcfs_schedule).to(self.dfT)
-
         eval_counter = {"cont": 0}
         def evaluator(X, y_history=None, x_history=None, metric_history=None):
             cont = eval_counter["cont"]
@@ -754,21 +822,8 @@ class powerstate_edge(powerstate):
             # Calculate
             # ***************************************************************************************************************
 
-            # Reassemble the full DV vector: interior controls from the solver +
-            # the fixed LCFS aLy DVs, so calculate()/modify() see all DVs and
-            # x_history stores the full-dimensional vector for FluxMatch_Xopt.
-            if lcfs_schedule is not None:
-                row = lcfs_schedule[min(cont, lcfs_schedule.shape[0] - 1)].reshape(1, -1)
-                lf = row.expand(X.shape[0], -1)
-                X_full = torch.cat([X, lf.to(X)], dim=1)
-            elif lcfs_fixed is not None:
-                lf = lcfs_fixed if lcfs_fixed.shape[0] == X.shape[0] else lcfs_fixed[:1].expand(X.shape[0], -1)
-                X_full = torch.cat([X, lf.to(X)], dim=1)
-            else:
-                X_full = X
-
             folder_run = folder / "transport_simulation_folder" if folder_main is not None else IOtools.expandPath('~/scratch/')
-            QTransport, QTarget, _, _ = self.calculate(X_full, nameRun=nameRun, folder=folder_run, evaluation_number=cont)
+            QTransport, QTarget, _, _ = self.calculate(X, nameRun=nameRun, folder=folder_run, evaluation_number=cont)
 
             eval_counter["cont"] = cont + 1
 
@@ -788,9 +843,7 @@ class powerstate_edge(powerstate):
             # Metric is the mean of the absolute value of the residual
             yMetric = -yRes.mean(axis=-1).detach()
 
-            # Store values. x_history holds the *interior* control vector X
-            # (matching the solver's relaxation dimension); the fixed LCFS
-            # columns are re-appended to FluxMatch_Xopt after the solve.
+            # Store values.
             if y_history is not None:
                 y_history.append(yRes.detach())
             if x_history is not None:
@@ -802,16 +855,11 @@ class powerstate_edge(powerstate):
 
         # Initialize optimization controls. For generalized parameterizers,
         # Xcurrent already carries the active control vector.
-        lcfs_fixed = None
         if isinstance(self.Xcurrent, torch.Tensor) and self.Xcurrent.numel() > 0:
             self.modify(self.Xcurrent)  # Ensure profiles are consistent with Xcurrent
             x0 = self.Xcurrent.detach().clone()
             if x0.ndim == 1:
                 x0 = x0.unsqueeze(0)
-            # Hold LCFS aLy DVs fixed; relax only the interior columns.
-            if x0.shape[1] > n_interior:
-                lcfs_fixed = x0[:, n_interior:].clone()
-                x0 = x0[:, :n_interior].clone()
         else:
             # Backward-compatible fallback for legacy aL-profile controls.
             x0 = torch.Tensor().to(self.plasma["aLte"])
@@ -837,21 +885,6 @@ class powerstate_edge(powerstate):
         
         self.FluxMatch_Yopt, self.FluxMatch_Xopt = Yopt[:,index_best[1],:], Xopt[:,index_best[1],:]
 
-        # Re-append the LCFS aLy DV columns so FluxMatch_Xopt is the full DV
-        # vector (interior trajectory + LCFS), matching the declared DVs.
-        if lcfs_schedule is not None:
-            m = self.FluxMatch_Xopt.shape[0]
-            sched = lcfs_schedule[:m]
-            if sched.shape[0] < m:  # pad with the last row if trajectory is longer
-                pad = sched[-1:].expand(m - sched.shape[0], -1)
-                sched = torch.cat([sched, pad], dim=0)
-            self.FluxMatch_Xopt = torch.cat([self.FluxMatch_Xopt, sched.to(self.FluxMatch_Xopt)], dim=1)
-            self._lcfs_init_schedule = None  # one-shot: only for this init relaxation
-        elif lcfs_fixed is not None:
-            lf_row = lcfs_fixed[index_best[1]] if lcfs_fixed.shape[0] > index_best[1] else lcfs_fixed[0]
-            lf_traj = lf_row.unsqueeze(0).expand(self.FluxMatch_Xopt.shape[0], -1).to(self.FluxMatch_Xopt)
-            self.FluxMatch_Xopt = torch.cat([self.FluxMatch_Xopt, lf_traj], dim=1)
-
         print("**********************************************************************************************")
         print(f"\t- Flux matching of powerstate finished, and took {IOtools.getTimeDifference(timeBeginning)}\n")
 
@@ -865,60 +898,29 @@ class powerstate_edge(powerstate):
 
     def calculateProfileFunctions(self, calculateRotationQuantities=True, **kwargs):
         """
-        Extend base ``calculateProfileFunctions`` to add the diamagnetic
-        toroidal rotation to ``w0`` before the rotation-derived quantities
-        (``w0_n``, ``aLw0_n``) are computed.
+        Extend base ``calculateProfileFunctions`` to build the edge magnetic
+        geometry (``R``, ``B_p``, ``B_T``) on the active plasma grid.
 
-        The base class computes ``p_prime`` (needed here) only during its
-        first-pass execution, so we call it with
-        ``calculateRotationQuantities=False`` first, compute the diamagnetic
-        contribution, and then calculate the rotation normalizations by hand.
-
-        Also computes ``plasma["E_rad"]`` — the normalized radial electric field
-        in NEO's ``DPHI0DR`` convention for ``ROTATION_MODEL=1``.
-
-        At the pedestal/edge, the diamagnetic flow dominates the toroidal ExB
-        rotation, so `Er` is approximated by the radial force balance::
-
-            Er [V/m] = -dp/dr / (Z_i * e * n_i)
-
-        The pressure gradient `dp/dr [Pa/m]` is recovered from the normalised
-        ``p_prime`` already computed in the base-class pass::
-
-            p_prime = 1e-7 * q * a² / r / B_unit² * dp/dr
-            → dp/dr = p_prime * B_unit² * roa * 1e7 / (q * a)
-
-        NEO's ``DPHI0DR = d(phi0)/dr * a * e / Te[J]``.  Since
-        ``Er = -d(phi0)/dr`` and ``Te[J] = te[keV]*1e3*e_SI``, e_SI cancels::
-
-            DPHI0DR = -Er * a / (te[keV] * 1e3)
-
-        The result is stored as ``plasma["E_rad"]`` and injected per-rho by
-        ``transport_neo.evaluate_neoclassical()`` when the ``"edge"`` NEO model
-        (``ROTATION_MODEL=1``) is active.
+        The rotation-derived quantities (``w0``, ``E_rad``, ``vexb``,
+        ``gamma_exb``, ``vexb_shear``, ``w0_n``, ``aLw0_n``, ...) are no longer
+        computed here: they are handled by :meth:`calculateRotation`, which is a
+        torchified / autodiff-safe drop-in (see
+        ``mitim_tools.edge_tools.rotation``) called at step 3b of
+        :meth:`calculate`. The base class is therefore invoked with
+        ``calculateRotationQuantities=False`` (its rotation normalizations rely
+        on ``w0`` / ``aLw0`` that only exist after :meth:`calculateRotation`).
         """
-        from scipy.constants import e as _q_e
-
         # First pass: everything except rotation-normalised quantities
         super().calculateProfileFunctions(calculateRotationQuantities=False, **kwargs)
 
         p = self.plasma
-
-        # Diamagnetic toroidal rotation
-        #   \omega_{dia} [rad/s] = -p' / (Z_D * e * n_D * B_unit)
-        # where p' is the pressure gradient in SI already encoded in
-        # plasma["p_prime"] and the remaining factors convert units.
-        B_unit  = p["B_unit"]                              # (batch, rho)  T
-        p_prime = p["p_prime"]                             # (batch, rho)  normalised
-        a       = p["a"].unsqueeze(-1)                     # (batch, 1)    m
-        n_main  = p["ni"][:, :, 0].clamp(min=1e-30)       # (batch, rho)  1e19 m⁻³
-        n_main_m3 = n_main * 1e19                          # → m⁻³
-
         batch = p["roa"].shape[0]
 
-        # Interpolate geometric factors to the active plasma grid and compute
-        # dpidr from the batched main-ion pressure profile.
-        if getattr(p,'B_p', None) is None and getattr(p,'R', None) is None:
+        # Interpolate magnetic geometry (R, Bp, B_T) onto the active plasma grid.
+        # These are fixed-background equilibrium quantities, so the numpy
+        # interpolation off self.profiles is fine (no autograd path runs through
+        # geometry); the rotation model consumes them as constants.
+        if getattr(p, 'B_p', None) is None and getattr(p, 'R', None) is None:
             rho_source_key = "rho(-)" if "rho(-)" in self.profiles.profiles else "rho"
             rho_source = np.asarray(self.profiles.profiles[rho_source_key])
             rho_target = p["roa"][0, :].detach().cpu().numpy()
@@ -938,20 +940,74 @@ class powerstate_edge(powerstate):
             p["B_p"] = Bp
             p["B_T"] = float(np.asarray(self.profiles.profiles["bcentr(T)"]).reshape(-1)[0]) * R / R0  # Toroidal field from total field and geometry
 
-        R  = p["R"]   # (batch, rho)
-        Bp = p["B_p"] # (batch, rho)
-        a = p['a'].view(-1)[0] # scalar, m
+    def calculateRotation(self):
+        """
+        Compute the self-consistent E×B rotation inputs (w0, E_rad, vexb,
+        gamma_exb / vexb_shear, mach, gamma_p, w0_n, aLw0_n) from the current
+        profiles via the torchified ``mitim_tools.edge_tools.rotation`` model.
 
-        # Main-ion pressure gradient on the radial coordinate r = a * roa.
-        # p_i [Pa] = n_i [m^-3] * T_i [J] with T_i [J] = ti[keV] * 1e3 * e.
-        pi_main_SI = n_main_m3 * p["ti"] * 1e3 * _q_e
-        pi_np = pi_main_SI.detach().cpu().numpy()
-        r_np = p['rmin'].detach().cpu().numpy()
-        dpidr_np = np.zeros_like(pi_np)
-        for b in range(batch):
-            dpidr_np[b, :] = np.gradient(pi_np[b, :], r_np[b, :], edge_order=2)
-        dpidr_SI = torch.from_numpy(dpidr_np).to(self.dfT)
-        #p["dpidr_main_SI"] = dpidr_SI
+        Autodiff-safe and batched: every output is a differentiable function of
+        the GP-parameterized profile tensors, so the flux GP / optimizer sees
+        d(vexb_shear)/d(DVs) etc. by chain rule. Requires the magnetic geometry
+        (``R``, ``B_p``, ``B_T``) already populated by
+        :meth:`calculateProfileFunctions`.
+
+        Configuration is read from ``self._rotation_options`` (an
+        ``evolution_options`` dict). Recognized keys:
+            mode          : "analytic" (default) | "vgen"
+            K_neo         : "sauter" (default) neoclassical poloidal-flow
+                            coefficient, or a fixed float (0.0 = pure diamagnetic,
+                            matching the previous behaviour) for comparison runs.
+            oversample    : int, refine onto an oversample x finer grid before
+                            differentiating the shear terms (default 2). Useful
+                            here since plasma["rho"] is coarse (~15 pts).
+            ln_lambda, smooth_window, mach_cut2 : see rotation.calculate_rotation.
+            vtor_source   : "zero" (default) | "user" | "extract_initial" imposed
+                            toroidal (mass) rotation entering Er as Vtor*Bp.
+            vtor_pairs    : [(rho, vtor_m_s), ...] for vtor_source="user" (a single
+                            pair = spatially constant V_tor).
+            vgen_every    : re-solve NEO every N calls in "vgen" mode (default 1).
+            vgen_drho     : radial spacing of the cropped vgen input.gacode
+                            (default 0.01); coarser = fewer NEO surfaces = faster.
+            vgen_options  : dict forwarded to rotation.w0_from_vgen.
+        In "vgen" mode a finite vtor_source chains through the NEO solve (written
+        into the input.gacode # vtor block); in "analytic" mode it enters Er
+        directly.
+        """
+        from mitim_tools.edge_tools import rotation
+
+        p = self.plasma
+        opts = getattr(self, "_rotation_options", {}) or {}
+
+        # Physics inputs shared by the main solve and the extract_initial back-out.
+        inputs = self._rotation_inputs()
+
+        # Optional imposed toroidal (mass) rotation Vtor [m/s]. In the analytic
+        # backend it enters the Er force balance as +Vtor*Bp; in the vgen backend
+        # it is written into the input.gacode # vtor block and solved by NEO.
+        vtor = self._resolve_vtor(inputs)
+
+        # Optional NEO vgen backend: solve for w0 externally (non-differentiable,
+        # cached on an outer cadence) and feed it in as w0_override; the shear
+        # variants are then built torch-side from that fixed w0. The vgen w0
+        # already includes the imposed vtor, so calculate_rotation ignores vtor
+        # on the w0_override path.
+        w0_override = self._rotation_w0_vgen(vtor) if opts.get("mode") == "vgen" else None
+
+        out = rotation.calculate_rotation(**inputs, vtor=vtor, w0_override=w0_override)
+
+        for key in ("w0", "Er", "E_rad", "vexb", "gamma_exb", "vexb_shear",
+                    "gamma_p", "mach", "w0_n", "aLw0_n", "tau_norm"):
+            p[key] = out[key]
+
+    def _rotation_inputs(self):
+        """Assemble the kwargs consumed by ``rotation.calculate_rotation`` from the
+        current plasma state. Shared by :meth:`calculateRotation` and the
+        ``extract_initial`` V_tor back-out in :meth:`_resolve_vtor` so both use an
+        identical force-balance (same K_neo, grid, and derivatives)."""
+        p = self.plasma
+        batch = p["roa"].shape[0]
+        opts = getattr(self, "_rotation_options", {}) or {}
 
         if "ions_set_Zi" in p:
             Zi = p["ions_set_Zi"]
@@ -961,27 +1017,57 @@ class powerstate_edge(powerstate):
         else:
             Z_main = torch.ones((batch, 1)).to(self.dfT)
 
-        p['tau_norm'] = a / p['c_s']  # [m] / [m/s] = [s]
-        w0_dia = -dpidr_SI / (Z_main * _q_e * n_main_m3 * R * Bp)
+        return dict(
+            ni_m3=p["ni"][:, :, 0] * 1e19,     # 1e19 m^-3 → m^-3
+            ti_keV=p["ti"],
+            te_keV=p["te"],
+            rmin=p["rmin"],
+            R=p["R"],
+            Bt=p["B_T"],
+            Bp=p["B_p"],
+            q=p["q"],
+            c_s=p["c_s"],
+            a=p["a"].unsqueeze(-1),
+            roa=p["roa"],
+            Z_main=Z_main,
+            Zeff=p.get("Zeff", None),
+            K_neo=opts.get("K_neo", "sauter"),
+            ln_lambda=opts.get("ln_lambda", 17.0),
+            smooth_window=opts.get("smooth_window", 1),
+            mach_cut2=opts.get("mach_cut2", 0.0),
+            oversample=int(opts.get("oversample", 2)),
+        )
 
-        p["w0"]     = w0_dia
-        Er = -R * Bp * p['w0']  # (batch, rho)  V/m
-        p["E_rad"] = -Er * a / (p["te"] * 1e3)
-        p['vexb'] = p["E_rad"] / p["B_T"]  # ExB velocity [m/s]
+    def _rotation_w0_vgen(self, vtor=None):
+        """Cached wrapper around :func:`rotation.w0_from_vgen_powerstate`.
 
-        p["w0_n"]   = w0_dia / p["c_s"]
-        p["aLw0_n"] = p["aLw0"] * w0_dia / p["c_s"]
+        The external NEO ``vgen`` DKE solve is expensive, so its (batch, rho) w0
+        result is cached and only re-solved every ``rotation_options['vgen_every']``
+        calls. The solve itself (per-batch input.gacode build, vtor block, NEO run)
+        lives in the ``rotation`` module.
+        """
+        from mitim_tools.edge_tools import rotation
 
-        # GAMMA_E = r * d/dr(v_exb/r) [1/s], computed directly on the fine grid.
-        rmin_np    = p['rmin'].detach().cpu().numpy()   # (batch, rho)
-        vexb_np    = p['vexb'].detach().cpu().numpy()   # (batch, rho)
-        gamma_exb_np = np.zeros_like(rmin_np)
-        for b in range(batch):
-            r_b = rmin_np[b, :]
-            vexb_over_r = vexb_np[b, :] / r_b
-            gamma_exb_np[b, :] = r_b * np.gradient(vexb_over_r, r_b, edge_order=2)
-        p["gamma_exb"] = torch.from_numpy(gamma_exb_np).to(self.dfT)  # [1/s]
-        p['vexb_shear'] = p["gamma_exb"] * p['tau_norm']  # [-]
+        opts = getattr(self, "_rotation_options", {}) or {}
+        every = int(opts.get("vgen_every", 1))
+        it = getattr(self, "_vgen_iter", 0)
+        cache = getattr(self, "_vgen_w0_cache", None)
+        self._vgen_iter = it + 1
+
+        if cache is not None and cache.shape == self.plasma["rho"].shape and (it % every != 0):
+            return cache
+
+        self._vgen_w0_cache = rotation.w0_from_vgen_powerstate(self, vtor=vtor)
+        return self._vgen_w0_cache
+
+    def _resolve_vtor(self, inputs=None):
+        """Imposed toroidal velocity Vtor [m/s] via :func:`rotation.resolve_vtor_powerstate`.
+
+        Thin delegation; the vtor_source resolution (zero / user / extract_initial)
+        and its caching live in the ``rotation`` module.
+        """
+        from mitim_tools.edge_tools import rotation
+        return rotation.resolve_vtor_powerstate(self, inputs=inputs)
 
     # ------------------------------------------------------------------
     # Edge physics
@@ -1007,17 +1093,6 @@ class powerstate_edge(powerstate):
             )
 
         model = self._bc_model_instance
-
-        # Section 6 tie-in: if the BC model advertises per-channel soft-prior
-        # stiffness (sigma_y, e.g. TwoFluidSynthesis), adopt it for the LCFS DVs
-        # unless the user explicitly set lcfs_sigma in edge_options.
-        if self._lcfs_dv_enabled and hasattr(model, "sigma_y") and isinstance(model.sigma_y, dict):
-            for ch in self.lcfs_dv_channels:
-                if ch in self._lcfs_sigma_opt:
-                    continue  # user override wins
-                key = f"aL{ch}"
-                if key in model.sigma_y:
-                    self.lcfs_sigma[ch] = float(model.sigma_y[key])
 
         batch  = self.plasma["te"].shape[0]
 
@@ -1049,15 +1124,6 @@ class powerstate_edge(powerstate):
             self.bc_dict = copy.deepcopy(self.bc_dict_batch[0])
             for key, (val, _roa_loc) in self.bc_dict.items():
                 self._lcfs_bc[key] = float(val)
-
-        # Section 6: capture the BC-model aLy(1) as the soft-prior mean F_y per
-        # channel *before* modify() overrides the aLy boundary with the DV value.
-        if self._lcfs_dv_enabled:
-            self.lcfs_prior = {}
-            for ch in self.lcfs_dv_channels:
-                key = f"aL{ch}"
-                if key in self.bc_tensors:
-                    self.lcfs_prior[ch] = self.bc_tensors[key]["val"].detach().reshape(-1).clone()
 
     def calculateChargeStates(self):
         """
@@ -1091,7 +1157,15 @@ class powerstate_edge(powerstate):
 
         # Unpack charge-state distribution into tracked impurity and main-ion channels.
         # nz_all[..., -1] = fully ionized impurity; Σ_z z*nz_all gives impurity charge density.
-        if "nz_all" in self.plasma and "ni" in self.plasma and "ne" in self.plasma:
+        # Only a REAL solution may be unpacked: NullChargeStates writes nz_all = 0 as a
+        # placeholder, which would zero the experimental impurity, hand all of ne to the main
+        # ion and drive Zeff -> 1 -- silently, since quasineutrality still closes on that state.
+        if (
+            str(self._cs_model_name).lower() not in ("null", "none")
+            and "nz_all" in self.plasma
+            and "ni" in self.plasma
+            and "ne" in self.plasma
+        ):
             nz_all = self.plasma["nz_all"]  # (batch, rho, nZ+1)
             ni = self.plasma["ni"]
             ne = self.plasma["ne"]
@@ -1104,47 +1178,16 @@ class powerstate_edge(powerstate):
                     neginf=0.0,
                 ).clamp(min=0.0)
 
-            main_idx = int(getattr(model, "main_ion_species_index", 0))
-            if 0 <= main_idx < ni.shape[-1]:
-                Z_states = torch.arange(
-                    nz_all.shape[-1], dtype=nz_all.dtype, device=nz_all.device
-                )
-                imp_charge = (nz_all * Z_states.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-                ni[..., main_idx] = torch.nan_to_num(
-                    ne - imp_charge,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                ).clamp(min=0.0)
-
             # Keep nZ synchronized to the tracked fully ionized impurity channel.
             if "nZ" in self.plasma and self.impurityPosition < ni.shape[-1]:
                 self.plasma["nZ"] = ni[..., self.impurityPosition]
 
-        # Recompute Zeff from the final ni state (supports Zi as 1D or batched 2D).
-        if (
-            "ions_set_Zi" in self.plasma
-            and "ne" in self.plasma
-            and "ni" in self.plasma
-        ):
-            Zi = self.plasma["ions_set_Zi"]
-            ne = self.plasma["ne"]
-            ni = self.plasma["ni"]
-
-            Zi_use = None
-            if Zi.dim() == 1 and Zi.shape[0] == ni.shape[-1]:
-                Zi_use = Zi.unsqueeze(0).expand(ni.shape[0], -1)
-            elif Zi.dim() == 2 and Zi.shape[0] == ni.shape[0] and Zi.shape[1] == ni.shape[-1]:
-                Zi_use = Zi
-
-            if Zi_use is not None and ne.shape == ni[:, :, 0].shape:
-                Zeff_computed = (ni * (Zi_use.unsqueeze(1) ** 2)).sum(dim=-1) / ne.clamp(min=1e-30)
-                self.plasma["Zeff"] = torch.nan_to_num(
-                    Zeff_computed,
-                    nan=0.0,
-                    posinf=0.0,
-                    neginf=0.0,
-                )
+        # Single quasineutrality/Zeff closure, shared with the parameterizer path in
+        # modify(). It reads the impurity charge from nz_all when a real charge-state
+        # solution exists and from the fully-stripped nZ otherwise, so QN and Zeff are
+        # always taken from the same source.
+        self._main_ion_index = int(getattr(model, "main_ion_species_index", 0))
+        self._enforce_quasineutrality()
 
         # Keep impurity fraction consistent with updated impurity densities.
         if "ne" in self.plasma:
@@ -1218,63 +1261,6 @@ class powerstate_edge(powerstate):
         # Charge-state solvers can update ni / nZ; keep aLni* and aLnZ consistent.
         if str(self._cs_model_name).lower() not in ("null", "none"):
             self._refresh_density_scale_lengths()
-
-    def _apply_edge_uq_inflation(self):
-        """
-        Inflate plasma uncertainties with edge-UQ calibration when enabled.
-
-        This remains localized to edge runs and is intentionally non-fatal:
-        if calibration cannot be loaded, the run continues with native stds.
-        """
-        if not self._edge_uq_enable or self._edge_uq_disabled:
-            return
-
-        if self._edge_uq_calib is None:
-            try:
-                if self._edge_uq_calib_dir is None:
-                    raise ValueError("edge_uq_calib_dir is not set")
-
-                from pathlib import Path
-                from mitim_tools.edge_tools.edge_uq import EdgeUQCalibration
-
-                calib_dir = Path(IOtools.expandPath(self._edge_uq_calib_dir))
-                self._edge_uq_calib = EdgeUQCalibration(output_dir=calib_dir)
-                self._edge_uq_calib.load_calibration(label=self._edge_uq_calib_label)
-
-                print(
-                    f"[powerstate_edge] Loaded edge-UQ calibration from {IOtools.clipstr(calib_dir)} "
-                    f"(label={self._edge_uq_calib_label})",
-                    typeMsg="i",
-                )
-            except Exception as exc:
-                if not self._edge_uq_warned:
-                    print(
-                        f"[powerstate_edge] edge_uq_enable=True but calibration could not be loaded: {exc}. "
-                        "Continuing without edge-UQ inflation.",
-                        typeMsg="w",
-                    )
-                    self._edge_uq_warned = True
-                self._edge_uq_disabled = True
-                return
-
-        try:
-            from mitim_tools.edge_tools.edge_uq import inflate_powerstate_stds_with_edge_uq
-
-            inflate_powerstate_stds_with_edge_uq(
-                self,
-                self._edge_uq_calib,
-                channel_mapping=self._edge_uq_channel_mapping,
-                scale_factor=self._edge_uq_scale_factor,
-            )
-        except Exception as exc:
-            if not self._edge_uq_warned:
-                print(
-                    f"[powerstate_edge] edge-UQ inflation failed: {exc}. "
-                    "Continuing without edge-UQ inflation.",
-                    typeMsg="w",
-                )
-                self._edge_uq_warned = True
-            self._edge_uq_disabled = True
 
     def calculateElm(self):
         """
@@ -1803,48 +1789,6 @@ class powerstate_edge(powerstate):
             self.X_dict[ch] = X[:, i0 : i0 + w]
             i0 += w
 
-        # Section 6: trailing columns (beyond the interior knot params) are the
-        # per-channel LCFS aLy DVs, ordered by self.lcfs_dv_channels.
-        self.X_lcfs = None
-        if self._lcfs_dv_enabled and self.lcfs_dv_channels and X.shape[1] > i0:
-            n_lcfs = len(self.lcfs_dv_channels)
-            if X.shape[1] - i0 >= n_lcfs:
-                self.X_lcfs = X[:, i0 : i0 + n_lcfs]
-
-    def _override_lcfs_bc_with_dv(self):
-        """
-        Replace the BC-model aLy(1) value with the optimizer-controlled LCFS DV.
-
-        The DV slice ``self.X_lcfs`` has shape (batch, n_lcfs) ordered by
-        ``self.lcfs_dv_channels``. Both the tensorized BC representation
-        (``self.bc_tensors``) and the scalar fallback (``self.bc_dict``) are
-        updated so that whichever path ``modify()`` takes reads the DV value.
-        """
-        if not self._lcfs_dv_enabled or self.X_lcfs is None:
-            return
-
-        for j, ch in enumerate(self.lcfs_dv_channels):
-            key = f"aL{ch}"
-            dv_col = self.X_lcfs[:, j].reshape(-1, 1)  # (batch,1), keeps grad
-
-            if isinstance(self.bc_tensors, dict) and key in self.bc_tensors:
-                entry = self.bc_tensors[key]
-                entry["val"] = dv_col.to(self.dfT)
-                # loc/mask must share the DV batch dimension so that
-                # _is_batched_bc_input detects this as a batched BC (it requires
-                # both val and loc to have shape[0] == batch_size).
-                entry["loc"] = torch.ones_like(dv_col).to(self.dfT)
-                entry["mask"] = torch.ones_like(dv_col, dtype=torch.bool, device=self.dfT.device)
-            elif isinstance(self.bc_tensors, dict):
-                self.bc_tensors[key] = {
-                    "val": dv_col.to(self.dfT),
-                    "loc": torch.ones_like(dv_col).to(self.dfT),
-                    "mask": torch.ones_like(dv_col, dtype=torch.bool, device=self.dfT.device),
-                }
-
-            # Scalar fallback uses the first batch element.
-            self.bc_dict[key] = [float(dv_col.reshape(-1)[0].item()), 1.0]
-
     # ------------------------------------------------------------------
     # Override: calculate()
     # ------------------------------------------------------------------
@@ -1857,12 +1801,12 @@ class powerstate_edge(powerstate):
 
         Step sequence (additions relative to ``powerstate.calculate()`` marked >>>)
         ---------------------------------------------------------------------------
-        >>> 1.  self.calculateBoundaryConditions()   ← updates _lcfs_bc from SOL model
-        2.  self.modify(X)                           ← enforces LCFS BC via override above
-        3.  self.calculateProfileFunctions()         ← includes diamagnetic w0
-        >>> 3b. self.calculateNeutrals()             ← D⁰ density → writes plasma['n0']
-        >>> 3c. self.calculateImpurities()           ← Aurora CS (uses plasma['n0'] for CXR)
-        >>> 3d. self._apply_edge_uq_inflation()      ← optional std inflation from edge-UQ calib
+        >>> 1.  self.calculateBoundaryConditions()   ← updates LCFS BCs from SOL model
+        2.  self.modify(X)                           ← reconstructs profiles + pins LCFS BCs
+        3.  self.calculateProfileFunctions()         ← builds edge geometry (R, Bp, B_T)
+        >>> 3b. self.calculateRotation()             ← torchified w0 / E_rad / vexb_shear
+        >>> 3c. self.calculateNeutrals()             ← D⁰ density → writes plasma['n0']
+        >>> 3d. self.calculateImpurities()           ← Aurora CS (uses plasma['n0'] for CXR)
         4.  self.calculateTargets(...)               ← uses analytical_model_edge
         5.  self.calculateTransport(...)
         >>> 6.  self.calculateElm()                  ← peeling-ballooning ELM penalty
@@ -1872,23 +1816,24 @@ class powerstate_edge(powerstate):
         folder = IOtools.expandPath(folder)
         self._solver_scratch_folder = folder
 
-        # 1. Separatrix boundary conditions → updates _lcfs_bc
+        # 1. Separatrix boundary conditions → updates the LCFS BCs
         self.calculateBoundaryConditions()
 
-        # 2. Reconstruct predicted profiles according to parameterization with LCFS BC enforcement
+        # 2. Reconstruct predicted profiles according to parameterization (LCFS BCs pinned)
         self.modify(X)
 
-        # 3. Profile-derived quantities (GB units, nuei, ρ_s, c_s, …)
+        # 3. Profile-derived quantities (GB units, nuei, ρ_s, c_s, …) + edge geometry
         self.calculateProfileFunctions()
 
-        # 3b. Main-ion neutral density (D⁰) → populates n0, S_ion_main, nu_ioniz_main, tau_n0
+        # 3b. Self-consistent E×B rotation (torchified, autodiff-safe): w0, E_rad,
+        #     vexb, gamma_exb/vexb_shear, mach, gamma_p, w0_n, aLw0_n
+        self.calculateRotation()
+
+        # 3c. Main-ion neutral density (D⁰) → populates n0, S_ion_main, nu_ioniz_main, tau_n0
         self.calculateNeutrals()
 
-        # 3c. Impurity charge-state distribution and radiation (uses plasma['n0'] for CXR)
+        # 3d. Impurity charge-state distribution and radiation (uses plasma['n0'] for CXR)
         self.calculateImpurities()
-
-        # 3d. Optional edge-UQ uncertainty inflation (if configured in edge_options)
-        self._apply_edge_uq_inflation()
 
         # 4. Sources and sinks
         relative_error_assumed = self.target_options["options"]["percent_error"]

@@ -123,12 +123,17 @@ def orderArray(arr, base=None):
     return np.array([a for _, a in sortedList])
 
 
-def arePointsEqual(x1, x2):
-    isEqual = True
-    for i in range(x1.shape[0]):
-        isEqual = isEqual and (x1[i] == x2[i])
+def arePointsEqual(x1, x2, rtol=1e-5, atol=1e-4):
+    """
+    Two DV vectors are considered the same point if they agree within tolerance.
 
-    return isEqual
+    Tolerance-based (not bitwise ==) so that a candidate which an optimizer
+    returns within solver/transform round-off of an existing training point is
+    recognized as a duplicate. This keeps the acquisition-side de-duplication
+    consistent with the logging-side match in BOgraphics.optimization_data.find_point
+    (np.allclose), preventing re-evaluation of an already-evaluated point.
+    """
+    return bool(torch.allclose(torch.as_tensor(x1), torch.as_tensor(x2), rtol=rtol, atol=atol))
 
 
 def simple_deriv(x, y):

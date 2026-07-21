@@ -201,7 +201,16 @@ def simple_relaxation( flux_residual_evaluator, x_initial, bounds=None, solver_o
 
     print_each = solver_options.get("print_each", 1e2)
     write_trajectory = solver_options.get("write_trajectory", True)
-    
+
+    # Optional seed-phase perturbation: jitter each calculated next step by Gaussian
+    # noise of std = interior_perturb_frac * (bounds range), so the relaxation march
+    # evaluates spread-out points that break the near-collinear aLte/aLti/aLne
+    # exploration (better GP seeding). Applied to the marched steps only (not the
+    # initial point), and each perturbed point is what gets evaluated -- no extra
+    # evaluations are introduced.
+    interior_perturb_frac = float(solver_options.get("interior_perturb_frac", 0.0))
+    _perturb_rng = np.random.default_rng(int(solver_options.get("interior_perturb_seed", 0)))
+
     thr_bounds = 1e-4 # To avoid being exactly in the bounds (relative -> 0.01%)
 
     # ********************************************************************************************
@@ -254,6 +263,19 @@ def simple_relaxation( flux_residual_evaluator, x_initial, bounds=None, solver_o
 
         # Make it the new point
         x = x_new.clone()
+
+        # Optional: perturb the calculated next step before evaluating it (seeding).
+        if interior_perturb_frac > 0.0:
+            if bounds is not None:
+                scale = interior_perturb_frac * (bounds[1, :] - bounds[0, :])
+            else:
+                scale = interior_perturb_frac * x.abs().clamp(min=1e-6)
+            noise = torch.as_tensor(
+                _perturb_rng.normal(0.0, 1.0, size=tuple(x.shape)),
+                dtype=x.dtype, device=x.device)
+            x = x + noise * scale
+            if bounds is not None:
+                x = x.clamp(min=bounds[0, :], max=bounds[1, :])
 
         # Evaluate new residual
         Q, QT, M = flux_residual_evaluator(

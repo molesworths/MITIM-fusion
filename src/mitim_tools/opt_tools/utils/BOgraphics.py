@@ -933,7 +933,9 @@ class optimization_data:
         matches = df_sub.apply(lambda row: np.allclose(row, x), axis=1)
         df = self.data[matches]
 
-        return df, df['Iteration'].item() if len(df) > 0 else None
+        # df may contain >1 row when an identical DV vector is re-proposed; take the
+        # first match's iteration (.item() requires exactly one row and otherwise raises).
+        return df, df['Iteration'].iloc[0] if len(df) > 0 else None
 
     def grab_data_point(self, x, printStuff=True):
 

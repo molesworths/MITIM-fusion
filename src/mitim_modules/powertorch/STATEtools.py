@@ -678,7 +678,11 @@ class powerstate:
         q = self.plasma["q"]
         roa1d = roa[0] if roa.dim() > 1 else roa
         dq_droa = torch.gradient(q, spacing=(roa1d,), dim=-1)[0]
-        self.plasma["shear"] = (roa / q.clamp_min(1e-8)) * dq_droa
+        # Guard the denominator WITHOUT destroying q's sign: q is negative for the
+        # usual GACODE sign convention, and clamp_min(1e-8) would map q~-5.8 -> 1e-8,
+        # blowing shear up to ~1e9. Clamp the MAGNITUDE, keep the sign.
+        q_safe = torch.where(q.abs() > 1e-8, q, torch.full_like(q, 1e-8))
+        self.plasma["shear"] = (roa / q_safe) * dq_droa
         
         aLni = [self.plasma[f"aLni{i}"] for i in range(self.plasma["ni"].shape[-1])]
         

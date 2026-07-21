@@ -461,6 +461,10 @@ def pointsOperation_common(x_opt, y_opt_residual, z_opt, fun, best_points=None):
     evaluators = fun.evaluators
     stepSettings = fun.stepSettings
 
+    # Track whether the optimizer actually proposed any genuinely-new point, or
+    # whether every candidate coincided (within tolerance) with the training set.
+    had_candidates = x_opt.shape[0] > 0
+
     xopt_new, yopt_new, zopt_new = (
         torch.Tensor().to(x_opt),
         torch.Tensor().to(y_opt_residual),
@@ -524,6 +528,11 @@ def pointsOperation_common(x_opt, y_opt_residual, z_opt, fun, best_points=None):
             print(
                 f"\t- Removed {removedNum} points because they were more than I wanted: {x_opt.shape[0]}"
             )
+
+    # If we started with candidates but every one collided with the training
+    # set, the surrogate's optimum is a point we have already evaluated -- a
+    # genuine convergence signal that no new point can be proposed.
+    fun.no_new_points = had_candidates and (x_opt.shape[0] == 0)
 
     if len(x_opt) == 0:
         x_opt = y_opt_residual = z_opt = torch.Tensor([[]]).to(evaluators["GP"].train_X)
@@ -604,6 +613,18 @@ def cleanupCandidateSet(
     x_opt, y_opt_residual, z_opt = pointsOperation_common(
         x_opt, y_opt_residual, z_opt, fun, best_points=best_points
     )
+
+    # If every proposed candidate coincided (within tolerance) with an already
+    # evaluated point and stop-on-convergence is requested, return an empty set
+    # (shape (0, nDV)) so the outer loop can register a hard finish instead of
+    # re-evaluating a duplicate or filling with a random jitter point.
+    stop_if_no_new = fun.stepSettings["optimization_options"]["convergence_options"].get("stop_if_no_new_points", False)
+    if stop_if_no_new and getattr(fun, "no_new_points", False):
+        print("\t- No new point could be proposed: acquisition optimum coincides with an evaluated point within tolerance. Requesting stop.", typeMsg="i")
+        nDV = fun.evaluators["GP"].train_X.shape[1]
+        empty_x = torch.zeros((0, nDV)).to(fun.evaluators["GP"].train_X)
+        empty_1d = torch.zeros((0,)).to(fun.evaluators["GP"].train_X)
+        return empty_x, empty_1d, empty_1d, empty_1d
 
     if x_opt.nelement() > 0:
         method = TESTtools.identifyType(z_opt[0].item())

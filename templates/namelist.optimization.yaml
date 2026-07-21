@@ -12,6 +12,7 @@ evaluation_options:
 # Convergence options for the BO optimization process
 convergence_options:
   maximum_iterations: 5
+  stop_if_no_new_points: false
   stopping_criteria: "import::mitim_tools.opt_tools.STRATEGYtools.stopping_criteria_default"
   stopping_criteria_parameters:
     maximum_value: -0.001
@@ -46,7 +47,7 @@ acquisition_options:
       keep_best: 1
     sr:
       num_restarts: 5
-      maxiter: 1000
+      maxiter: 100
       relative_improvement_for_stopping: 0.001
       relax: 0.1
       relax_dyn: true

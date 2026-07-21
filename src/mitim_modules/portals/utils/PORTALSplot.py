@@ -1080,6 +1080,8 @@ def _autoscale_y_for_domain(ax, xlim):
                 ylo = min(ylo, vals.min())
                 yhi = max(yhi, vals.max())
     for coll in ax.collections:
+        if coll.get_label() == _EDGE_UQ_BAND_TAG:
+            continue  # UQ bands may be very wide near the LCFS; don't drive the scale
         try:
             for path in coll.get_paths():
                 v = path.vertices
@@ -1173,6 +1175,170 @@ def _edge_get_rho_1d(power):
     return np.asarray(rho, dtype=float)
 
 
+_EDGE_UQ_BAND_TAG = "_edge_uq_band"
+
+
+def _edge_uq_std_suffix(power):
+    """Suffix under which run_edge_uq stored per-observable profile stds."""
+    summary = getattr(power, "_edge_uq_summary", None)
+    if isinstance(summary, dict):
+        return summary.get("profile_std_suffix", "_uq_std")
+    return "_uq_std"
+
+
+def _edge_extract_uq_std_1d(power, key, species_index=None):
+    """1D edge-UQ std for observable ``key`` (returns None if not propagated)."""
+    return _edge_extract_profile_1d(
+        power, key + _edge_uq_std_suffix(power), species_index=species_index
+    )
+
+
+def _edge_dv_proxy(power):
+    """Optimizer DV proxy: aLy control-point values at rhoCP for predicted channels.
+
+    Returns a 1D numpy vector (or None) usable for nearest-iteration matching.
+    """
+    rho = _edge_get_rho_1d(power)
+    x_cp = _edge_to_numpy(getattr(power, "rhoCP", None))
+    if rho is None or x_cp is None or len(x_cp) == 0:
+        return None
+    aLy_map = {"te": "aLte", "ti": "aLti", "ne": "aLne", "nZ": "aLnZ", "w0": "aLw0"}
+    parts = []
+    for ch in getattr(power, "predicted_channels", []):
+        key = aLy_map.get(ch)
+        aLy = _edge_extract_profile_1d(power, key) if key else None
+        if aLy is None:
+            return None
+        parts.append(np.interp(np.asarray(x_cp, dtype=float), rho, aLy))
+    if not parts:
+        return None
+    return np.concatenate(parts)
+
+
+def _edge_find_uq_donor(self, target_idx, first_key="te"):
+    """Powerstate whose edge-UQ stds should decorate iteration ``target_idx``.
+
+    Edge-UQ profile stds are only propagated once surrogates exist (later
+    iterations).  If ``target_idx`` lacks them, fall back to the UQ-bearing
+    iteration closest in optimizer-DV space.  Returns a powerstate or None.
+    """
+    powerstates = getattr(self, "powerstates", [])
+    if target_idx is None or target_idx >= len(powerstates):
+        return None
+    suffix = _edge_uq_std_suffix(powerstates[target_idx])
+
+    def _has_uq(ps):
+        return (first_key + suffix) in ps.plasma
+
+    if _has_uq(powerstates[target_idx]):
+        return powerstates[target_idx]
+
+    target_dv = _edge_dv_proxy(powerstates[target_idx])
+    best, best_d = None, np.inf
+    for ps in powerstates:
+        if not _has_uq(ps):
+            continue
+        dv = _edge_dv_proxy(ps)
+        if target_dv is not None and dv is not None and dv.shape == target_dv.shape:
+            d = float(np.linalg.norm(dv - target_dv))
+        else:
+            d = np.inf
+        if d < best_d:
+            best, best_d = ps, d
+    # If no DV proxy was comparable, fall back to the last UQ-bearing iteration.
+    if best is None:
+        for ps in powerstates:
+            if _has_uq(ps):
+                best = ps
+    return best
+
+
+def _edge_residual_uq(self):
+    """Per-iteration edge-UQ sigmas for the residual/objective traces.
+
+    Reads each powerstate's ``_edge_uq_summary`` (present only on UQ-bearing
+    iterations) and returns arrays aligned with ``self.evaluations``:
+      - per predicted channel ``ch``: sigma of ``res{Ch}M`` (= mean over rhoCP of
+        |residual|), propagated as sqrt(sum sigma_cp^2)/n_cp assuming independence
+      - ``"OF"``: the objective sigma (``sigma_J``)
+    Entries are NaN where no summary exists.
+    """
+    powerstates = getattr(self, "powerstates", [])
+    n = len(powerstates)
+    channels = list(getattr(self, "predicted_channels", []))
+    out = {ch: np.full(n, np.nan) for ch in channels}
+    out["OF"] = np.full(n, np.nan)
+    for i, ps in enumerate(powerstates):
+        summary = getattr(ps, "_edge_uq_summary", None)
+        if not isinstance(summary, dict):
+            continue
+        out["OF"][i] = float(summary.get("sigma_J", np.nan))
+        order = summary.get("order", None)
+        rstd = summary.get("residual_std", None)
+        if order is None or rstd is None:
+            continue
+        rstd = np.asarray(_edge_to_numpy(rstd), dtype=float)
+        for ch in channels:
+            idxs = [k for k, (c, _cp) in enumerate(order) if c == ch]
+            if idxs:
+                s = rstd[idxs]
+                out[ch][i] = float(np.sqrt(np.nansum(s ** 2)) / len(idxs))
+    return out
+
+
+def _edge_log_yerr(vals, sig):
+    """Asymmetric yerr keeping the lower whisker positive for log-scale axes."""
+    vals = np.asarray(vals, dtype=float)
+    sig = np.asarray(sig, dtype=float)
+    lower = np.minimum(sig, np.abs(vals) * 0.999)
+    return np.vstack([lower, sig])
+
+
+def _ci_to_z(ci):
+    """Two-sided normal z-multiplier for a central credible interval ``ci``."""
+    try:
+        from statistics import NormalDist
+        return float(NormalDist().inv_cdf(0.5 + 0.5 * float(ci)))
+    except Exception:
+        # Fallback for the default 90% band if statistics is unavailable.
+        return 1.6448536269514722
+
+
+def _edge_plot_uq_band(ax, x, y, std, z, color, where=None, mul=1.0):
+    """Fill a ``z``-sigma band around ``y`` (both already in plot units via mul)."""
+    if y is None or std is None:
+        return
+    y = np.asarray(y, dtype=float) * mul
+    std = np.asarray(std, dtype=float) * abs(mul)
+    if y.shape != std.shape:
+        return
+    lo, hi = y - z * std, y + z * std
+    # Tagged so _autoscale_y_for_domain scales to the mean lines, not the (often
+    # very wide near the LCFS) UQ band -- the band then simply clips to the axis.
+    if where is not None:
+        ax.fill_between(x, lo, hi, where=where, color=color, alpha=0.15, lw=0,
+                        zorder=0.8, label=_EDGE_UQ_BAND_TAG)
+    else:
+        ax.fill_between(x, lo, hi, color=color, alpha=0.15, lw=0,
+                        zorder=0.8, label=_EDGE_UQ_BAND_TAG)
+
+
+def _edge_ratio_std(num, den, num_std, den_std):
+    """First-order std of ``num/den`` given independent stds of num and den."""
+    if num is None or den is None or num_std is None:
+        return None
+    num = np.asarray(num, dtype=float)
+    den = np.asarray(den, dtype=float)
+    num_std = np.asarray(num_std, dtype=float)
+    rel = np.zeros_like(num)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rel = (num_std / num) ** 2
+        if den_std is not None:
+            rel = rel + (np.asarray(den_std, dtype=float) / den) ** 2
+        ratio = num / den
+        return np.abs(ratio) * np.sqrt(rel)
+
+
 def _edge_plot_state_markers(ax, x, y, x_cp, color, marker="o"):
     if x is None or y is None or x_cp is None:
         return
@@ -1191,6 +1357,7 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
     indexToMaximize=None,
     indeces_extra=None,
     stds=2,
+    ci_band=0.90,
     fontsize_leg=6,
     file_save=None,
     **kwargs,
@@ -1220,6 +1387,13 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
 
     xlim = _compute_domain_xlim_for_edge(self)
 
+    # z-multiplier for the requested central credible interval (edge-UQ bands)
+    z_ci = _ci_to_z(ci_band)
+
+    # Edge-UQ profile stds only exist once surrogates are built (later iters); use
+    # the UQ-bearing iteration closest in DV space to the highlighted one for bands.
+    uq_power = _edge_find_uq_donor(self, indexToMaximize)
+
     channel_specs = [
         {
             "name": "te",
@@ -1231,6 +1405,7 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
             "tr_turb_stds": "QeMWm2_tr_turb_stds",
             "tr_neoc_stds": "QeMWm2_tr_neoc_stds",
             "tar": "QeMWm2",
+            "tar_stds": "QeMWm2_stds",
             "ylab": "$T_e$ (keV)",
             "ylab_aLy": "$a/L_{Te}$",
             "ylab_flux": "$Q_e$ ($MW/m^2$)",
@@ -1246,6 +1421,7 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
             "tr_turb_stds": "QiMWm2_tr_turb_stds",
             "tr_neoc_stds": "QiMWm2_tr_neoc_stds",
             "tar": "QiMWm2",
+            "tar_stds": "QiMWm2_stds",
             "ylab": "$T_i$ (keV)",
             "ylab_aLy": "$a/L_{Ti}$",
             "ylab_flux": "$Q_i$ ($MW/m^2$)",
@@ -1261,6 +1437,7 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
             "tr_turb_stds": "Ge1E20m2_tr_turb_stds",
             "tr_neoc_stds": "Ge1E20m2_tr_neoc_stds",
             "tar": "Ge1E20m2",
+            "tar_stds": "Ge1E20m2_stds",
             "ylab": "$n_e$ ($10^{20}m^{-3}$)",
             "ylab_aLy": "$a/L_{ne}$",
             "ylab_flux": "$\\Gamma_e$ ($10^{20}/s/m^2$)",
@@ -1268,11 +1445,18 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
         },
     ]
 
+    # Optional 4th row: per-source uncertainty breakdown (stacked variance bars,
+    # one per rhoCP) beneath each flux panel -- shown only when the UQ donor
+    # carries an edge-UQ breakdown (powerstate._edge_uq_breakdown).
+    _uq_breakdown = getattr(uq_power, "_edge_uq_breakdown", None) if uq_power is not None else None
+    _nrows = 4 if _uq_breakdown else 3
+
     grid = plt.GridSpec(
-        nrows=3,
+        nrows=_nrows,
         ncols=5,
         width_ratios=[1.0, 1.0, 1.0, 1.0, 1.25],
-        hspace=0.28,
+        height_ratios=([1.0, 1.0, 1.0, 0.62] if _uq_breakdown else None),
+        hspace=0.34 if _uq_breakdown else 0.28,
         wspace=0.42,
     )
     fig.subplots_adjust(left=0.06, right=0.97)
@@ -1281,6 +1465,8 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
     axes_prof = [fig.add_subplot(grid[0, j]) for j in range(3)]
     axes_grad = [fig.add_subplot(grid[1, j]) for j in range(3)]
     axes_flux = [fig.add_subplot(grid[2, j]) for j in range(3)]
+    axes_breakdown = ([fig.add_subplot(grid[3, j]) for j in range(3)]
+                      if _uq_breakdown else None)
 
     # Col 3: w0 (row 0), n0 (row 1), nZ (row 2)
     ax_w0  = fig.add_subplot(grid[0, 3])
@@ -1313,75 +1499,120 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
             y = _edge_extract_profile_1d(power, spec["y"], species_index=species_idx)
             if y is not None:
                 axes_prof[j].plot(x, y * spec["mul_y"], lw=2, color=col, label=lab)
+                if idx == indexToMaximize and uq_power is not None:
+                    y_std = _edge_extract_uq_std_1d(uq_power, spec["y"], species_index=species_idx)
+                    _edge_plot_uq_band(axes_prof[j], x, y, y_std, z_ci, col, mul=spec["mul_y"])
 
             aLy = _edge_extract_profile_1d(power, spec["aLy"], species_index=species_idx)
             if aLy is not None:
                 axes_grad[j].plot(x, aLy, lw=1.8, color=col)
+                if idx == indexToMaximize and uq_power is not None:
+                    aLy_std = _edge_extract_uq_std_1d(uq_power, spec["aLy"], species_index=species_idx)
+                    _edge_plot_uq_band(axes_grad[j], x, aLy, aLy_std, z_ci, col)
 
             tr  = _edge_extract_profile_1d(power, spec["tr"],  species_index=species_idx_tr)
             tar = _edge_extract_profile_1d(power, spec["tar"], species_index=species_idx_tr)
 
             if tr is not None:
-                axes_flux[j].plot(x, tr, "-", lw=2, color=col,
+                # Restrict the modeled-flux line (and its band below) to the
+                # flux-matching range [min(rhoCP), max(rhoCP)] so it does not
+                # extend to the domain minimum or rho=1.
+                if x_cp is not None and len(x_cp) > 0:
+                    cp_mask = (x >= np.min(x_cp)) & (x <= np.max(x_cp))
+                else:
+                    cp_mask = np.ones_like(x, dtype=bool)
+                x_tr = np.where(cp_mask, x, np.nan)
+
+                axes_flux[j].plot(x_tr, tr, "-", lw=2, color=col,
                                   label="Transport" if idx == self.ibest else None)
                 _edge_plot_state_markers(axes_flux[j], x, tr, x_cp, col, marker="s")
 
-                tr_std = _edge_extract_profile_1d(power, spec["tr_stds"],
+                # Edge-UQ stds live on the UQ-bearing donor iteration, NOT
+                # necessarily on the plotted (best) iteration -- match the profile
+                # bands above, which source their std from uq_power.
+                std_src = uq_power if uq_power is not None else power
+                tr_std = _edge_extract_profile_1d(std_src, spec["tr_stds"],
                                                   species_index=species_idx_tr)
                 if tr_std is None:
-                    tr_turb_std = _edge_extract_profile_1d(power, spec["tr_turb_stds"],
+                    tr_turb_std = _edge_extract_profile_1d(std_src, spec["tr_turb_stds"],
                                                            species_index=species_idx_tr)
-                    tr_neoc_std = _edge_extract_profile_1d(power, spec["tr_neoc_stds"],
+                    tr_neoc_std = _edge_extract_profile_1d(std_src, spec["tr_neoc_stds"],
                                                            species_index=species_idx_tr)
                     if tr_turb_std is not None and tr_neoc_std is not None:
                         tr_std = tr_turb_std + tr_neoc_std
 
                 if tr_std is not None and idx == indexToMaximize:
-                    axes_flux[j].fill_between(x, tr - stds * tr_std, tr + stds * tr_std,
-                                              color=col, alpha=0.18)
+                    axes_flux[j].fill_between(x, tr - z_ci * tr_std, tr + z_ci * tr_std,
+                                              where=cp_mask, color=col, alpha=0.18)
 
             if tar is not None:
                 axes_flux[j].plot(x, tar, "--", lw=1.7, color=col,
                                   label="Target" if idx == self.ibest else None)
+                if idx == indexToMaximize:
+                    std_src = uq_power if uq_power is not None else power
+                    tar_std = _edge_extract_profile_1d(std_src, spec["tar_stds"],
+                                                       species_index=species_idx_tr)
+                    if tar_std is not None:
+                        _edge_plot_uq_band(axes_flux[j], x, tar, tar_std, z_ci, col)
 
         # --- Col 3: w0 profile ---
         w0 = _edge_extract_profile_1d(power, "w0")
         if w0 is not None:
             ax_w0.plot(x, w0 * 1e-3, lw=2, color=col, label=lab)
             _edge_plot_state_markers(ax_w0, x, w0 * 1e-3, x_cp, col)
+            if idx == indexToMaximize and uq_power is not None:
+                w0_std = _edge_extract_uq_std_1d(uq_power, "w0")
+                _edge_plot_uq_band(ax_w0, x, w0, w0_std, z_ci, col, mul=1e-3)
 
         # --- Col 3: n0/ne (row 1) ---
         n0 = _edge_extract_profile_1d(power, "n0")
         ne_local = _edge_extract_profile_1d(power, "ne")
+        ne_std = _edge_extract_uq_std_1d(uq_power, "ne") if uq_power is not None else None
         if n0 is not None and ne_local is not None:
-            ax_n0.plot(x, np.where(ne_local > 0, n0 / ne_local, np.nan),
-                       lw=2, color=col, label=lab)
+            ratio = np.where(ne_local > 0, n0 / ne_local, np.nan)
+            ax_n0.plot(x, ratio, lw=2, color=col, label=lab)
+            if idx == indexToMaximize and uq_power is not None:
+                n0_std = _edge_extract_uq_std_1d(uq_power, "n0")
+                ratio_std = _edge_ratio_std(n0, ne_local, n0_std, ne_std)
+                _edge_plot_uq_band(ax_n0, x, ratio, ratio_std, z_ci, col)
 
         # --- Col 3: nZ/ne per charge state (row 2) ---
         nz_all = _edge_to_numpy(power.plasma.get("nz_all", None))
         if nz_all is not None and nz_all.ndim == 3 and nz_all.shape[2] > 0 and ne_local is not None:
             nz = nz_all[0, :, :]
             n_stages = nz.shape[1]
+            nz_all_std = (
+                _edge_to_numpy(uq_power.plasma.get("nz_all" + _edge_uq_std_suffix(uq_power), None))
+                if uq_power is not None else None
+            )
             _nz_colors = GRAPHICStools.listColors()
             for s in range(n_stages):
                 lbl = f"z={s}" if idx == self.ibest else None
+                ratio = np.where(ne_local > 0, nz[:, s] / ne_local, np.nan)
                 ax_nZ.plot(
                     x,
-                    np.where(ne_local > 0, nz[:, s] / ne_local, np.nan),
+                    ratio,
                     lw=1.5 if s < n_stages - 1 else 2.0,
                     ls="--" if s < n_stages - 1 else "-",
                     alpha=0.6 if s < n_stages - 1 else 1.0,
                     color=col,
                     label=lbl,
                 )
+                if (idx == indexToMaximize and s == n_stages - 1
+                        and nz_all_std is not None and nz_all_std.ndim == 3):
+                    nz_std_s = nz_all_std[0, :, s]
+                    ratio_std = _edge_ratio_std(nz[:, s], ne_local, nz_std_s, ne_std)
+                    _edge_plot_uq_band(ax_nZ, x, ratio, ratio_std, z_ci, col)
         elif ne_local is not None:
-            nZ_raw = _edge_extract_profile_1d(
-                power, "nZ",
-                species_index=self.runWithImpurity if hasattr(self, "runWithImpurity") else None,
-            )
+            species_idx_nZ = self.runWithImpurity if hasattr(self, "runWithImpurity") else None
+            nZ_raw = _edge_extract_profile_1d(power, "nZ", species_index=species_idx_nZ)
             if nZ_raw is not None:
-                ax_nZ.plot(x, np.where(ne_local > 0, nZ_raw / ne_local, np.nan),
-                           lw=2, color=col, label=lab)
+                ratio = np.where(ne_local > 0, nZ_raw / ne_local, np.nan)
+                ax_nZ.plot(x, ratio, lw=2, color=col, label=lab)
+                if idx == indexToMaximize and uq_power is not None:
+                    nZ_std = _edge_extract_uq_std_1d(uq_power, "nZ", species_index=species_idx_nZ)
+                    ratio_std = _edge_ratio_std(nZ_raw, ne_local, nZ_std, ne_std)
+                    _edge_plot_uq_band(ax_nZ, x, ratio, ratio_std, z_ci, col)
 
     # --- Channel column decorations ---
     for j, spec in enumerate(channel_specs):
@@ -1399,6 +1630,37 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
         if j == 0:
             axes_prof[j].legend(prop={"size": fontsize_leg * 1.2}, loc="best")
             axes_flux[j].legend(prop={"size": fontsize_leg * 1.1}, loc="best")
+
+    # --- Row 3: per-source uncertainty breakdown beneath each flux panel ---
+    # Stacked VARIANCE bars, one per rhoCP, of the turbulent transport flux; fixed
+    # source->color registry so a source keeps its color across every panel.
+    if axes_breakdown is not None:
+        try:
+            from mitim_tools.edge_tools.uq.plotting import (
+                stacked_breakdown_axes, source_order_for)
+            bkeys = [spec["tr_turb_stds"][:-5] for spec in channel_specs]  # strip _stds
+            order = source_order_for(_uq_breakdown,
+                                     [k for k in bkeys if k in _uq_breakdown])
+            rho_fine = _edge_get_rho_1d(uq_power)
+            rcp = _edge_to_numpy(getattr(uq_power, "rhoCP", None))
+            if rho_fine is not None and rcp is not None and len(rcp):
+                idxs = [int(np.argmin(np.abs(rho_fine - float(r)))) for r in rcp]
+                cplabels = [f"{float(r):.2g}" for r in rcp]
+                legend_h = {}
+                for j, bk in enumerate(bkeys):
+                    legend_h.update(stacked_breakdown_axes(
+                        axes_breakdown[j], _uq_breakdown.get(bk), idxs, cplabels,
+                        order, ylabel=("var. frac." if j == 0 else None)))
+                    axes_breakdown[j].set_xlabel("$\\rho_{CP}$", fontsize=8)
+                    axes_flux[j].set_xlabel("")          # rho now on the bar row
+                    axes_flux[j].set_xticklabels([])
+                if legend_h:
+                    axes_breakdown[2].legend(
+                        legend_h.values(), legend_h.keys(), fontsize=6.5,
+                        loc="center left", bbox_to_anchor=(1.02, 0.5),
+                        frameon=False, title="UQ source", title_fontsize=7)
+        except Exception as e:
+            print(f"\t- edge-UQ breakdown row skipped: {e}", typeMsg="w")
 
     # --- Col 3 decorations ---
     ax_w0.set_title("Rotation")
@@ -1420,18 +1682,28 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
         ax.set_xlim(xlim)
         _autoscale_y_for_domain(ax, xlim)
 
-    # --- Col 4: channel residuals ---
+    # --- Col 4: channel residuals (with edge-UQ error bars where available) ---
+    res_uq = _edge_residual_uq(self)
+
+    def _plot_residual(ax, ch, values, marker):
+        line, = ax.plot(self.evaluations, values, marker, lw=1.0, ms=2,
+                        label=self.labelsFluxes.get(ch, ch))
+        sig = res_uq.get(ch)
+        if sig is not None and np.any(np.isfinite(sig)):
+            ax.errorbar(self.evaluations, values, yerr=_edge_log_yerr(values, z_ci * sig),
+                        fmt="none", ecolor=line.get_color(), elinewidth=0.8,
+                        capsize=1.5, alpha=0.7)
+
     if "te" in self.predicted_channels:
-        ax_metric1.plot(self.evaluations, self.resTeM, "-o", lw=1.0, ms=2, label=self.labelsFluxes["te"])
+        _plot_residual(ax_metric1, "te", self.resTeM, "-o")
     if "ti" in self.predicted_channels:
-        ax_metric1.plot(self.evaluations, self.resTiM, "-s", lw=1.0, ms=2, label=self.labelsFluxes["ti"])
+        _plot_residual(ax_metric1, "ti", self.resTiM, "-s")
     if "ne" in self.predicted_channels:
-        ax_metric1.plot(self.evaluations, self.resneM, "-*", lw=1.0, ms=2, label=self.labelsFluxes["ne"])
+        _plot_residual(ax_metric1, "ne", self.resneM, "-*")
     if "nZ" in self.predicted_channels:
-        ax_metric1.plot(self.evaluations, self.resnZM, "-v", lw=1.0, ms=2, label=self.labelsFluxes["nZ"])
+        _plot_residual(ax_metric1, "nZ", self.resnZM, "-v")
     if "w0" in self.predicted_channels and hasattr(self, "resw0M"):
-        ax_metric1.plot(self.evaluations, self.resw0M, "-^", lw=1.0, ms=2,
-                        label=self.labelsFluxes.get("w0", "w0"))
+        _plot_residual(ax_metric1, "w0", self.resw0M, "-^")
     ax_metric1.set_ylabel("Channel residual", fontsize=ylabel_fontsize, labelpad=ylabel_pad)
     ax_metric1.set_xticklabels([])
     GRAPHICStools.addDenseAxis(ax_metric1, n=5)
@@ -1444,6 +1716,12 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
     # --- Col 4: OF + L1 residuals ---
     ax_metric2.plot(self.evaluations, self.resM, "-o", lw=1.0, c="olive", ms=2,
                     label="OF: $\\frac{1}{N}L_2$")
+    sig_of = res_uq.get("OF")
+    if sig_of is not None and np.any(np.isfinite(sig_of)):
+        ax_metric2.errorbar(self.evaluations, self.resM,
+                            yerr=_edge_log_yerr(self.resM, z_ci * sig_of),
+                            fmt="none", ecolor="olive", elinewidth=0.8,
+                            capsize=1.5, alpha=0.7)
     ax_metric2.plot(self.evaluations, self.resCheck, "-o", lw=1.0, c="rebeccapurple", ms=2,
                     label="$\\frac{1}{N}L_1$")
     ax_metric2.set_ylabel("Residual", fontsize=ylabel_fontsize, labelpad=ylabel_pad)

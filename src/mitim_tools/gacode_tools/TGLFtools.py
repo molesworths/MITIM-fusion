@@ -5476,62 +5476,45 @@ class TGLFoutput(SIMtools.GACODEoutput):
         GRAPHICStools.addDenseAxis(ax)
 
 
-def processGrowthRates(k, g, f, gs, fs, klow=0.8, coeff=0):
-    linearDict = {}
+def processGrowthRates(k, g, f, gs, fs, klow=0.8, kETG=5.0, coeff=0, nsubdom=None):
+    """Maximum growth rate per mode type over the dominant AND subdominant eigen-roots.
 
-    subdom = 1
+    nsubdom: how many subdominant roots to search (None = all available).
+
+    The maximum for each type is taken over ALL searched roots. The previous rule -- fall
+    back to the first subdominant root only if the dominant root gave exactly zero for
+    that type -- under-reports: the dominant root is only the most unstable at each ky,
+    not per type, so a subdominant root can carry a LARGER mode of a given type at a
+    different ky while the dominant root still has a nonzero (smaller) one.
+    """
+    linearDict = {}
 
     # Calculate maximum growth rate (and the associated frequency and mode number) for each mode type
 
-    dict_g = processDominated(k, g, f, krange=[0, klow], coeff=coeff)
-    if gs is not None and gs.shape[1] > 0:
-        dict_gs = processDominated(
-            k, gs[:, subdom - 1], fs[:, subdom - 1], krange=[0, klow], coeff=coeff
-        )
+    roots = [(g, f)]
+    if gs is not None and np.ndim(gs) > 1 and np.shape(gs)[1] > 0:
+        navail = np.shape(gs)[1]
+        nuse = navail if nsubdom is None else int(np.clip(nsubdom, 0, navail))
+        roots += [(np.asarray(gs)[:, j], np.asarray(fs)[:, j]) for j in range(nuse)]
 
-    # If for each type there's no a dominant mode, use subdominant
+    dicts = [
+        processDominated(k, gg, ff, krange=[0, klow], kETG=kETG, coeff=coeff)
+        for gg, ff in roots
+    ]
 
-    g_ITG_max, f_ITG_max, k_ITG_max = (
-        dict_g["g_ITG_max"],
-        dict_g["f_ITG_max"],
-        dict_g["k_ITG_max"],
-    )
-    if g_ITG_max == 0 and gs is not None and gs.shape[1] > 0:
-        g_ITG_max, f_ITG_max, k_ITG_max = (
-            dict_gs["g_ITG_max"],
-            dict_gs["f_ITG_max"],
-            dict_gs["k_ITG_max"],
-        )
+    # Store: per type, the best root
 
-    g_ETG_max, f_ETG_max, k_ETG_max = (
-        dict_g["g_ETG_max"],
-        dict_g["f_ETG_max"],
-        dict_g["k_ETG_max"],
-    )
-    if g_ETG_max == 0 and gs is not None and gs.shape[1] > 0:
-        g_ETG_max, f_ETG_max, k_ETG_max = (
-            dict_gs["g_ETG_max"],
-            dict_gs["f_ETG_max"],
-            dict_gs["k_ETG_max"],
-        )
+    for typ in ("ITG", "ETG", "TEM", "midk"):
+        j = int(np.argmax([d[f"g_{typ}_max"] for d in dicts]))
+        linearDict[typ] = {
+            "g_max": dicts[j][f"g_{typ}_max"],
+            "f_max": dicts[j][f"f_{typ}_max"],
+            "k_max": dicts[j][f"k_{typ}_max"],
+        }
 
-    g_TEM_max, f_TEM_max, k_TEM_max = (
-        dict_g["g_TEM_max"],
-        dict_g["f_TEM_max"],
-        dict_g["k_TEM_max"],
-    )
-    if g_TEM_max == 0 and gs is not None and gs.shape[1] > 0:
-        g_TEM_max, f_TEM_max, k_TEM_max = (
-            dict_gs["g_TEM_max"],
-            dict_gs["f_TEM_max"],
-            dict_gs["k_TEM_max"],
-        )
-
-    # Store
-
-    linearDict["ITG"] = {"g_max": g_ITG_max, "f_max": f_ITG_max, "k_max": k_ITG_max}
-    linearDict["ETG"] = {"g_max": g_ETG_max, "f_max": f_ETG_max, "k_max": k_ETG_max}
-    linearDict["TEM"] = {"g_max": g_TEM_max, "f_max": f_TEM_max, "k_max": k_TEM_max}
+    g_ITG_max = linearDict["ITG"]["g_max"]
+    g_ETG_max = linearDict["ETG"]["g_max"]
+    g_TEM_max = linearDict["TEM"]["g_max"]
 
     # Calculate some eta metrics
 
@@ -5545,52 +5528,53 @@ def processGrowthRates(k, g, f, gs, fs, klow=0.8, coeff=0):
     else:
         eta_ITGTEM = g_ITG_max / g_TEM_max
 
+    # low-k maximum, consistent with the per-type maxima above (may come from different roots)
+    g_all = np.array([g_ITG_max, g_TEM_max])
+    f_all = np.array([linearDict["ITG"]["f_max"], linearDict["TEM"]["f_max"]])
+    k_all = np.array([linearDict["ITG"]["k_max"], linearDict["TEM"]["k_max"]])
+    jlow = int(np.argmax(g_all))
+
     linearDict["metrics"] = {
         "eta_ITGETG": eta_ITGETG,
         "eta_ITGTEM": eta_ITGTEM,
-        "g_lowk_max": dict_g["g_lowk_max"],
-        "f_lowk_max": dict_g["f_lowk_max"],
-        "k_lowk_max": dict_g["k_lowk_max"],
+        "g_lowk_max": g_all[jlow],
+        "f_lowk_max": f_all[jlow],
+        "k_lowk_max": k_all[jlow],
     }
 
     return linearDict
 
 
-def processDominated(k, g, f, krange=[0.0, 0.8], coeff=0):
-    # ky range to consider ITG and TEM modes
-    ilow = np.argmin(np.abs(k - krange[0]))
-    ihigh = np.argmin(np.abs(k - krange[1]))
+def processDominated(k, g, f, krange=[0.0, 0.8], kETG=5.0, coeff=0):
+    """Classify one eigen-root's ky spectrum into ITG / TEM / ETG and return each maximum.
+
+    Bands are selected by ky VALUE, not by nearest-grid-point index. Using
+    argmin(|k-krange|) snapped the boundary onto the ky grid, so the same klow gave a
+    different effective edge at different radii (e.g. 0.805 vs 0.717 for klow=0.8) and
+    could place ky>klow inside the "low-k" band.
+
+    ETG requires ky >= kETG (electron scale). Previously ETG was "anything above the ion
+    band", which labelled ky~0.9 modes as ETG. Modes in the intermediate band
+    krange[1] < ky < kETG are neither ion- nor electron-scale; they are reported
+    separately as 'midk' instead of being silently absorbed into ETG.
+
+    Note: ETG keeps the f>0 (electron-diamagnetic) test, so it can skip a *dominant*
+    electron-scale root that propagates in the ion direction and report a subdominant
+    electron-direction one instead. This does happen (e.g. an edge case at ky*rho_s~35 with
+    the dominant root at f<0), but such high-k roots carry ~0 flux, so the electron-direction
+    root is the transport-relevant one.
+    """
+    k, g, f = np.asarray(k), np.asarray(g), np.asarray(f)
 
     # ---------------------------------------------
     # ------- Separate contribution from each type
     # ---------------------------------------------
 
-    # ~~~~~~~ ITG
-    k_ITG, g_ITG, f_ITG = [], [], []
-    for i in range(len(k)):
-        if i <= ihigh and i >= ilow and f[i] < 0.0:
-            k_ITG.append(k[i])
-            g_ITG.append(g[i])
-            f_ITG.append(f[i])
-    k_ITG, g_ITG, f_ITG = np.array(k_ITG), np.array(g_ITG), np.array(f_ITG)
+    lowk = (k >= krange[0]) & (k <= krange[1])   # ion scale
+    etgk = k >= kETG                             # electron scale
+    midk = (k > krange[1]) & (k < kETG)          # neither
 
-    # ~~~~~~~ ETG
-    k_ETG, g_ETG, f_ETG = [], [], []
-    for i in range(len(k)):
-        if i > ihigh and f[i] > 0.0:
-            k_ETG.append(k[i])
-            g_ETG.append(g[i])
-            f_ETG.append(f[i])
-    k_ETG, g_ETG, f_ETG = np.array(k_ETG), np.array(g_ETG), np.array(f_ETG)
-
-    # ~~~~~~~ TEM
-    k_TEM, g_TEM, f_TEM = [], [], []
-    for i in range(len(k)):
-        if i <= ihigh and i >= ilow and f[i] > 0.0:
-            k_TEM.append(k[i])
-            g_TEM.append(g[i])
-            f_TEM.append(f[i])
-    k_TEM, g_TEM, f_TEM = np.array(k_TEM), np.array(g_TEM), np.array(f_TEM)
+    # TGLF writes freq=0 for roots it did not find, so the f<0 / f>0 tests also drop them
 
     # ---------------------------------------------
     # ------- Calculate the maximum of each type in that ky range
@@ -5598,30 +5582,18 @@ def processDominated(k, g, f, krange=[0.0, 0.8], coeff=0):
 
     # coeff will determine if it's just growth rate, zonal flow mixing of mixing length maxima
 
-    if len(g_ITG) > 0:
-        g_ITG_max, k_ITG_max, f_ITG_max = (
-            np.max(g_ITG / k_ITG**coeff),
-            k_ITG[np.argmax(g_ITG / k_ITG**coeff)],
-            f_ITG[np.argmax(g_ITG / k_ITG**coeff)],
-        )
-    else:
-        g_ITG_max, k_ITG_max, f_ITG_max = 0, np.nan, np.nan
-    if len(g_ETG) > 0:
-        g_ETG_max, k_ETG_max, f_ETG_max = (
-            np.max(g_ETG / k_ETG**coeff),
-            k_ETG[np.argmax(g_ETG / k_ETG**coeff)],
-            f_ETG[np.argmax(g_ETG / k_ETG**coeff)],
-        )
-    else:
-        g_ETG_max, k_ETG_max, f_ETG_max = 0, np.nan, np.nan
-    if len(g_TEM) > 0:
-        g_TEM_max, k_TEM_max, f_TEM_max = (
-            np.max(g_TEM / k_TEM**coeff),
-            k_TEM[np.argmax(g_TEM / k_TEM**coeff)],
-            f_TEM[np.argmax(g_TEM / k_TEM**coeff)],
-        )
-    else:
-        g_TEM_max, k_TEM_max, f_TEM_max = 0, np.nan, np.nan
+    def _max(sel):
+        idx = np.where(sel)[0]
+        if idx.size == 0:
+            return 0, np.nan, np.nan
+        w = g[idx] / k[idx] ** coeff
+        j = int(np.argmax(w))
+        return w[j], k[idx][j], f[idx][j]
+
+    g_ITG_max, k_ITG_max, f_ITG_max = _max(lowk & (f < 0.0))
+    g_TEM_max, k_TEM_max, f_TEM_max = _max(lowk & (f > 0.0))
+    g_ETG_max, k_ETG_max, f_ETG_max = _max(etgk & (f > 0.0))
+    g_midk_max, k_midk_max, f_midk_max = _max(midk & (f != 0.0))
 
     # Overall max at low k
     g_all = np.array([g_ITG_max, g_TEM_max])
@@ -5636,16 +5608,19 @@ def processDominated(k, g, f, krange=[0.0, 0.8], coeff=0):
 
     return {
         "g_ITG_max": g_ITG_max,
-        "g_ETG_max": g_TEM_max,
+        "g_ETG_max": g_ETG_max,
         "g_TEM_max": g_TEM_max,
+        "g_midk_max": g_midk_max,
         "g_lowk_max": g_max,
         "k_ITG_max": k_ITG_max,
-        "k_ETG_max": k_TEM_max,
+        "k_ETG_max": k_ETG_max,
         "k_TEM_max": k_TEM_max,
+        "k_midk_max": k_midk_max,
         "k_lowk_max": k_max,
         "f_ITG_max": f_ITG_max,
-        "f_ETG_max": f_TEM_max,
+        "f_ETG_max": f_ETG_max,
         "f_TEM_max": f_TEM_max,
+        "f_midk_max": f_midk_max,
         "f_lowk_max": f_max,
     }
 

@@ -110,6 +110,12 @@ def _edge_postprocessing(powerstate, integrated_targets=None, force_zero_particl
         p["Ge1E20m2"] = p["Ge_edgetargets"]   # 1E20/s/m^2
         p["GZ1E20m2"] = p["GZ_edgetargets"]   # 1E20/s/m^2
 
+    # Core-bound neutral escape (hot neutrals crossing the inner boundary) re-emerges
+    # in steady state as an outward electron flux; add it as a rarefied enclosed flow
+    # (Φ_inner/volp), analogous to the frozen wall term in Ge_edgetargets.
+    if "Ge_core_reinject" in p:
+        p["Ge1E20m2"] = p["Ge1E20m2"] + p["Ge_core_reinject"]  # 1E20/s/m^2
+
     p["MtJm2"] = p["Mt_edgetargets"]  # J/m^2  (no integrated source contribution)
 
     if force_zero_particle_flux:
@@ -180,6 +186,9 @@ class analytical_model_edge(analytical_model):
             if "qiz" in self.powerstate.plasma:
                 # Ionization energy is an electron-channel sink, not an e-i exchange term.
                 qe -= self.powerstate.plasma["qiz"]
+            if "qcx" in self.powerstate.plasma:
+                # Charge-exchange with cold neutrals is an ion-channel energy sink.
+                qi -= self.powerstate.plasma["qcx"]
 
         if "qfus" in self.powerstate.target_options['options']['targets_evolve']:
             qe +=  self.powerstate.plasma["qfuse"]
@@ -216,6 +225,7 @@ class analytical_model_edge(analytical_model):
         if "qie" in self.powerstate.target_options["options"]["targets_evolve"]:
             self._evaluate_energy_exchange()
             self._evaluate_ionization_loss()
+            self._evaluate_cx_loss()
 
         if "qfus" in self.powerstate.target_options["options"]["targets_evolve"]:
             self._evaluate_alpha_heating()
@@ -362,9 +372,13 @@ class analytical_model_edge(analytical_model):
         1.  **D⁰ ionisation** — from ``plasma['S_ion_main']`` [1e19 m⁻³ s⁻¹]
             (ADAS-based, pre-computed by ``calculateNeutrals()``).
         2.  **Impurity net ionisation (electrons)** —
-            ``Σ(scd·nz) - Σ(acd·nz)`` over charge states, applied only when
-            peak charge-weighted dilution ``max(Σ z·nz / ne) < 0.1``
-            (trace-impurity regime).
+            ``Σ(scd·nz) - Σ(acd·nz)`` over charge states.  This is the freed-
+            electron source ``Σ_z z·Ṅ_z`` and is exact by charge conservation
+            regardless of impurity concentration, so it is applied
+            unconditionally.  The peak charge-weighted dilution
+            ``max(Σ z·nz / ne)`` is only checked against
+            ``impurity_dilution_warn`` (default 0.5) to warn when the
+            quasineutrality-based ``ni`` reconstruction is being stressed.
         3.  **Fully ionised impurity source** — net source for the fully
             stripped stage only, used for ``GZ`` coupling.
 
@@ -402,7 +416,7 @@ class analytical_model_edge(analytical_model):
 
             p["qpar_main"] = p["qpar_main"] + S_ion * 0.1
 
-        # ── 2. Impurity net electron source (trace regime only) ─────────────
+        # ── 2. Impurity net electron source (charge-conserving, always valid) ─
         if (
             "nz_all"     in p
             and "nu_scd_imp" in p
@@ -420,22 +434,38 @@ class analytical_model_edge(analytical_model):
             Z_vec = torch.arange(nZ_plus1, dtype=nz.dtype, device=nz.device)
             charge_dens = (nz * Z_vec).sum(dim=-1)
             dilution = charge_dens / ne.clamp(min=1e-30)
-            trace_mask = dilution.max(dim=1).values < 0.1
 
             # nu_scd_imp / nu_acd_imp already include ne multiplication (s^-1).
+            # S_imp_net = Σ_z z·Ṅ_z is the freed-electron source; it is exact by
+            # charge conservation and does NOT require a trace-impurity assumption.
             S_imp_iz  = (scd[:, :, :-1] * nz[:, :, :-1]).sum(dim=-1)
             S_imp_rec = (acd[:, :,  1:] * nz[:, :,  1:]).sum(dim=-1)
             S_imp_net = S_imp_iz - S_imp_rec
 
-            if trace_mask.any():
-                p["qpar_imp"][trace_mask, :] = p["qpar_imp"][trace_mask, :] + S_imp_net[trace_mask, :] * 0.1
+            p["qpar_imp"] = p["qpar_imp"] + S_imp_net * 0.1
 
-                # Fully stripped impurity stage (charge Z):
-                # source from ionisation into Z minus recombination out of Z.
-                # scd[..., -2] drives (Z-1 -> Z), acd[..., -1] drives (Z -> Z-1).
-                if nZ_plus1 >= 2:
-                    S_Z = scd[:, :, -2] * nz[:, :, -2] - acd[:, :, -1] * nz[:, :, -1]
-                    p["qpar_Z"][trace_mask, :] = p["qpar_Z"][trace_mask, :] + S_Z[trace_mask, :] * 0.1
+            # Fully stripped impurity stage (charge Z):
+            # source from ionisation into Z minus recombination out of Z.
+            # scd[..., -2] drives (Z-1 -> Z), acd[..., -1] drives (Z -> Z-1).
+            if nZ_plus1 >= 2:
+                S_Z = scd[:, :, -2] * nz[:, :, -2] - acd[:, :, -1] * nz[:, :, -1]
+                p["qpar_Z"] = p["qpar_Z"] + S_Z * 0.1
+
+            # Diagnostic only: the electron source above is unconditional; this
+            # threshold flags when the quasineutrality-based ni reconstruction
+            # (done in calculateChargeStates) is being pushed hard.
+            dilution_warn = self.powerstate.target_options["options"].get(
+                "impurity_dilution_warn", 0.5
+            )
+            peak_dilution = dilution.max().item()
+            if peak_dilution > dilution_warn:
+                print(
+                    f"[analytical_model_edge] peak impurity charge dilution "
+                    f"max(Σz·nz/ne) = {peak_dilution:.3f} exceeds "
+                    f"{dilution_warn:.2f}; electron source retained but "
+                    f"quasineutral ni reconstruction may be stressed.",
+                    typeMsg="w",
+                )
 
         # Electron-wall source is main-ion plus impurity electron source.
         p["qpar_wall"] = p["qpar_main"] + p["qpar_imp"]
@@ -444,12 +474,39 @@ class analytical_model_edge(analytical_model):
     # ionization power loss
     # ------------------------------------------------------------------
 
+    def _aurora_H_radiation_active(self):
+        """
+        Return True when the Aurora H/D neutral *line* radiation channel is
+        available and will be added to ``qrad`` by ``_add_aurora_H_radiation``.
+
+        This gates the ionisation energy cost (see ``_evaluate_ionization_loss``)
+        so that the excitation/line-radiation part of the cost is not counted
+        twice — once analytically in ``qiz`` and once explicitly in ``qrad``.
+        """
+        p = self.powerstate.plasma
+        if "n0" not in p or p["n0"].abs().max().item() < 1e-30:
+            return False
+        try:
+            import aurora as _aurora_pkg  # noqa: F401
+        except ImportError:
+            return False
+        return True
+
     def _evaluate_ionization_loss(self):
         """
         ionisation power subtracted from qe.
 
-        Each D⁰ ionisation event costs ~40 eV (13.6 eV ionisation potential
-        plus ~26 eV of prior excitation radiation losses).
+        Energy cost per D⁰ ionisation event:
+
+          - When Aurora H/D neutral line radiation is active, the excitation
+            radiation preceding ionisation is already accounted for explicitly
+            in ``qrad`` (via ``_add_aurora_H_radiation``).  Counting it again
+            here would double-subtract it from the electron channel, so only
+            the bare 13.6 eV ionisation potential is charged to ``qiz``.
+
+          - Otherwise, a lumped effective cost of ~40 eV (13.6 eV potential
+            + ~26 eV of prior excitation radiation) is used, since the
+            radiative losses are not represented anywhere else.
 
         Uses ``plasma['S_ion_main']`` when available; falls back to the
         analytic rate when only ``plasma['n0']`` is present.
@@ -466,11 +523,62 @@ class analytical_model_edge(analytical_model):
         else:
             raise NotImplementedError("Ionisation loss evaluation requires S_ion_main")
 
-        E_ion_eff_J = 40.0 * 1.60218e-19
+        # Avoid double-counting excitation/line radiation already carried by qrad.
+        E_ion_eff_eV = 13.6 if self._aurora_H_radiation_active() else 40.0
+        E_ion_eff_J = E_ion_eff_eV * 1.60218e-19
         # Numerically equivalent to MW/m^3; kept in the same units as qie/qrad arrays.
         Q_ion_MWm3 = S_ion * 1e19 * E_ion_eff_J * 1e-6
 
         p["qiz"] = Q_ion_MWm3
+
+    # ------------------------------------------------------------------
+    # charge-exchange ion energy loss
+    # ------------------------------------------------------------------
+
+    def _evaluate_cx_loss(self):
+        """
+        Ion-channel energy sink from charge exchange with cold neutrals.
+
+        Each CX event (D⁺_hot + D⁰_cold → D⁰_hot + D⁺_cold) replaces a thermal
+        ion at the local ion temperature ``Ti`` with one at the neutral
+        temperature ``T0``, draining ``(3/2) k (Ti − T0)`` of ion energy per
+        event.  The volumetric event rate is ``R_cx = n0 × ν_cx`` where
+        ``ν_cx = n_i ⟨σv⟩_cx`` is provided by the neutrals solver
+        (``plasma['nu_cx_main']`` [s⁻¹]).
+
+        Neutral temperature model
+        -------------------------
+        Neutrals entering the closed-flux region have undergone many CX events
+        while crossing the SOL and are approximated as thermalised to the ion
+        temperature *at the LCFS*, ``T0 ≈ Ti(r=LCFS)``, held constant inward.
+        Because the pedestal/core ``Ti`` rises above the edge value, the sink
+        ``(Ti − T0)`` is positive across the pedestal and vanishes at the LCFS,
+        consistent with the near-thermal boundary neutrals.
+
+        This is an *ion* energy sink only; the ionisation potential and line
+        radiation are charged to the electron channel elsewhere (``qiz``,
+        ``qrad``).  A no-op when neutrals or the CX rate are absent.
+        """
+        p = self.powerstate.plasma
+        p["qcx"] = torch.zeros_like(p["te"])
+        if "n0" not in p or p["n0"].abs().max().item() < 1e-30:
+            return
+        if "nu_cx_main" not in p or p["nu_cx_main"].abs().max().item() < 1e-30:
+            return
+
+        n0_1e19 = _ensure_1e19_units(p["n0"], "n0")     # (batch, rho) [1e19 m⁻³]
+        nu_cx   = p["nu_cx_main"]                        # (batch, rho) [s⁻¹]
+
+        # Ion temperature and boundary (LCFS) neutral temperature [keV]
+        ti = p["ti"] if p["ti"].dim() == 2 else p["ti"][..., 0]
+        T0 = ti[:, -1:].expand_as(ti)                   # neutral temp ≈ Ti(LCFS)
+        dT_keV = (ti - T0).clamp(min=0.0)               # only cooling (Ti ≥ T0)
+
+        # R_cx = n0 × ν_cx  [m⁻³ s⁻¹]; energy per event (3/2)(Ti−T0) [J].
+        R_cx_m3s = n0_1e19 * 1e19 * nu_cx
+        E_cx_J   = 1.5 * dT_keV * 1e3 * 1.60218e-19
+        # W/m³ × 1e-6 → MW/m³ (numerically == W/cm³, matching qie/qiz/qrad units).
+        p["qcx"] = R_cx_m3s * E_cx_J * 1e-6
 
     def postprocessing(self, force_zero_particle_flux=False, relative_error_assumed=1.0):
         _edge_postprocessing(

@@ -69,19 +69,19 @@
     USE_BPER: true
 
 # Edge / pedestal configuration
-# KYGRID_MODEL=4 : extended ky grid with ETG scales included
-# XNU_MODEL=4    : pitch-angle-scattering collision model (better for steep-gradient pedestal)
-# ALPHA_P=0      : disable parallel velocity shear (rotation shear not reliable near separatrix)
-# ALPHA_MACH=0   : disable Mach-number correction (ExB handled separately via NEO DPHI0DR)
 "edge":
   controls:
     KYGRID_MODEL: 4
     XNU_MODEL: 4
     ALPHA_E: 1
     ALPHA_ZF: -1
-    ALPHA_P: 0
+    ALPHA_P: 0     # disable parallel-velocity shear: unreliable near the separatrix, and PVG becomes spurious with diamagnetic dominance in w0
     ALPHA_MACH: 0
     SAT_RULE: 3
     UNITS: CGYRO
-    USE_BPER: True
-    USE_BPAR: True
+    USE_BPER: False
+    USE_BPAR: False
+    NBASIS_MAX: 12
+    WIDTH: 3
+    WIDTH_MIN: 0.3
+    NMODES: 2

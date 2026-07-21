@@ -712,6 +712,26 @@ class EpedElm(ElmStability):
 
         params = self._extract_eped_inputs(powerstate, b)
 
+        # Negative-triangularity guard: EPED and EPED-NN are trained on the
+        # standard (positive-delta) peeling-ballooning database and give
+        # meaningless p_top_crit for delta < 0 (e.g. EPED-NN returns an absurdly
+        # low limit -> spurious ~10x ELM transport penalty on NT pedestals, which
+        # are in fact ELM-suppressed). Bypass the backend and return the neutral
+        # (no-ELM) state: elm_factor = 1, overshoot = 0. NT pedestal stability is
+        # a distinct physics problem, not captured by this model.
+        if float(params.get("delta", 1.0)) < 0.0:
+            if self.verbose:
+                print(
+                    f"\t[EpedElm] batch={b}: delta={params.get('delta'):.3f} < 0 "
+                    "(negative triangularity); EPED(-NN) untrained here -> no ELM penalty.",
+                    typeMsg="i",
+                )
+            self.elm_factor    = torch.ones(n_rho, dtype=dtype, device=device)
+            self.in_elm_region = torch.zeros(n_rho, dtype=torch.bool, device=device)
+            self.alpha_MHD     = torch.zeros(n_rho, dtype=dtype, device=device)
+            self.alpha_crit    = torch.ones(n_rho, dtype=dtype, device=device)
+            return
+
         rounded = {k: round(float(v), 3) for k, v in params.items()}
         h8 = hashlib.md5(
             json.dumps(rounded, sort_keys=True).encode()

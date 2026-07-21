@@ -16,7 +16,7 @@ def surrogate_selection_portals(output, surrogate_options):
         # If it's a target, just linear
         if output[3:6] == "tar":
             surrogate_options["TypeMean"] = 1
-            surrogate_options["TypeKernel"] = 2  # Constant kernel
+            surrogate_options["TypeKernel"] = 1  # Changed to RBF for edge cases
         # If it's not, standard case for fluxes
         else:
             surrogate_options["TypeMean"] = 2  # Linear in gradients, constant in rest
@@ -252,6 +252,7 @@ def GBfromXnorm(x, output, powerstate):
     elif varFull[:2] == "Mt":
         quantity = "Pgb"
     elif varFull[:2] == "Ge":
+        # ne is matched on the convective ENERGY flux Ce -> Qgb_convection.
         quantity = "Qgb_convection"
     elif varFull[:2] == "GZ":
         quantity = "Qgb_convection"

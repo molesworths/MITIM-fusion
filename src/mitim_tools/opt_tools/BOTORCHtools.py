@@ -29,6 +29,7 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
         train_X_added=torch.Tensor([]),
         train_Y_added=torch.Tensor([]),
         train_Yvar_added=torch.Tensor([]),
+        precomputed_train_data=None,
     ):
         """
         _added refers to already-transformed variables that are added from table
@@ -43,59 +44,78 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
         print("\t\t* Surrogate model options:")
         print(f"\t\t\t- FixedNoise: {FixedNoise} (extra noise: {learn_additional_noise}), TypeMean: {TypeMean}, TypeKernel: {TypeKernel}, ConstrainNoise: {ConstrainNoise:.1e}")
 
-        self.store_training(
-            train_X,
-            train_X_added,
-            train_Y,
-            train_Y_added,
-            train_Yvar,
-            train_Yvar_added,
-            input_transform,
-            outcome_transform,
-        )
-
-        """
-		----------------------------------------------------------------------------------------
-		What set_dimensions did, and select things to train (already transformed and normalized)
-		----------------------------------------------------------------------------------------
-		"""
-
         # Grab num_outputs
         self._num_outputs = train_Y.shape[-1]
 
-        # Grab ard_num_dims
-        if train_X.shape[0] > 0:
-            with torch.no_grad():
-                transformed_X = self.transform_inputs(
-                    X=train_X, input_transform=input_transform
-                )
-            self.ard_num_dims = transformed_X.shape[-1]
-        else:
-            self.ard_num_dims = train_X_added.shape[-1]
-            transformed_X = torch.empty((0, self.ard_num_dims)).to(train_X)
-
-        # Transform outcomes
-        if outcome_transform is not None:
-            train_Y, train_Yvar = outcome_transform(train_X, train_Y, train_Yvar)
-
-        # Added points are raw transformed, so I need to normalize them
-        if train_X_added.shape[0] > 0:
-            train_X_added = input_transform["tf2"](train_X_added)
-            train_Y_added, train_Yvar_added = outcome_transform["tf2"](
-                train_Y_added, train_Yvar_added
+        if precomputed_train_data is not None:
+            # Fast path: all constructEvaluationProfiles calls bypassed.
+            # Workers run full init+fit and return pre-computed tensors; the parent
+            # uses them to build a cheap shell that load_state_dict + normalization_pass
+            # can then populate correctly without any expensive physics evaluations.
+            self.ard_num_dims = precomputed_train_data["ard_num_dims"]
+            # Physics-only-transformed data (what store_training would have set)
+            self.train_X_usedToTrain = precomputed_train_data["train_X_usedToTrain"]
+            self.train_Y_usedToTrain = precomputed_train_data["train_Y_usedToTrain"]
+            self.train_Yvar_usedToTrain = precomputed_train_data["train_Yvar_usedToTrain"]
+            # Fully-transformed data (physics + normalization) for ExactGP training set
+            train_X_usedToTrain = precomputed_train_data["train_inputs_X"]
+            train_Y_usedToTrain = precomputed_train_data["train_targets_Y"]  # 1D
+            # Placeholder noise with correct shape; load_state_dict overwrites values
+            train_Yvar_usedToTrain = torch.zeros_like(train_Y_usedToTrain).clamp_min(1e-6)
+            self._input_batch_shape, self._aug_batch_shape = self.get_batch_dimensions(
+                train_X=train_X_usedToTrain, train_Y=train_Y_usedToTrain.unsqueeze(-1)
             )
-        # -----
+        else:
+            self.store_training(
+                train_X,
+                train_X_added,
+                train_Y,
+                train_Y_added,
+                train_Yvar,
+                train_Yvar_added,
+                input_transform,
+                outcome_transform,
+            )
 
-        train_X_usedToTrain = torch.cat((transformed_X, train_X_added), axis=0)
-        train_Y_usedToTrain = torch.cat((train_Y, train_Y_added), axis=0)
-        train_Yvar_usedToTrain = torch.cat((train_Yvar, train_Yvar_added), axis=0)
+            """
+    		----------------------------------------------------------------------------------------
+    		What set_dimensions did, and select things to train (already transformed and normalized)
+    		----------------------------------------------------------------------------------------
+    		"""
 
-        self._input_batch_shape, self._aug_batch_shape = self.get_batch_dimensions(
-            train_X=train_X_usedToTrain, train_Y=train_Y_usedToTrain
-        )
+            # Grab ard_num_dims
+            if train_X.shape[0] > 0:
+                with torch.no_grad():
+                    transformed_X = self.transform_inputs(
+                        X=train_X, input_transform=input_transform
+                    )
+                self.ard_num_dims = transformed_X.shape[-1]
+            else:
+                self.ard_num_dims = train_X_added.shape[-1]
+                transformed_X = torch.empty((0, self.ard_num_dims)).to(train_X)
 
-        train_Y_usedToTrain = train_Y_usedToTrain.squeeze(-1)
-        train_Yvar_usedToTrain = train_Yvar_usedToTrain.squeeze(-1)
+            # Transform outcomes
+            if outcome_transform is not None:
+                train_Y, train_Yvar = outcome_transform(train_X, train_Y, train_Yvar)
+
+            # Added points are raw transformed, so I need to normalize them
+            if train_X_added.shape[0] > 0:
+                train_X_added = input_transform["tf2"](train_X_added)
+                train_Y_added, train_Yvar_added = outcome_transform["tf2"](
+                    train_Y_added, train_Yvar_added
+                )
+            # -----
+
+            train_X_usedToTrain = torch.cat((transformed_X, train_X_added), axis=0)
+            train_Y_usedToTrain = torch.cat((train_Y, train_Y_added), axis=0)
+            train_Yvar_usedToTrain = torch.cat((train_Yvar, train_Yvar_added), axis=0)
+
+            self._input_batch_shape, self._aug_batch_shape = self.get_batch_dimensions(
+                train_X=train_X_usedToTrain, train_Y=train_Y_usedToTrain
+            )
+
+            train_Y_usedToTrain = train_Y_usedToTrain.squeeze(-1)
+            train_Yvar_usedToTrain = train_Yvar_usedToTrain.squeeze(-1)
 
         """
 		-----------------------------------------------------------------------
@@ -170,6 +190,14 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
             self.mean_module = MITIM_LinearMeanGradients(
                 batch_shape=self._aug_batch_shape, variables=variables, output=output
             )
+        elif TypeMean == 3:
+            # Critical-gradient mean: linear in driving gradients (like TypeMean=2)
+            # but with the secondary (x_lcfs-driven: nuei/tite/beta_e/...) features
+            # modulating both the diffusivity and the offset. See
+            # MITIM_CriticalGradientMean for the rationale (Phase-3 x_lcfs support).
+            self.mean_module = MITIM_CriticalGradientMean(
+                batch_shape=self._aug_batch_shape, variables=variables, output=output
+            )
 
         """
 		-----------------------------------------------------------------------
@@ -238,6 +266,14 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
             self.input_transform = input_transform
 
         self.to(train_X)
+
+    def load_state_dict(self, state_dict, strict=True, **kwargs):
+        # Always load without botorch's transform-preserving path.  That path calls
+        # ChainedOutcomeTransform.untransform(), which we haven't implemented (and don't
+        # need: normalization buffers are managed externally via normalization_pass).
+        # Bypassing it avoids a NotImplementedError for every caller — our parallel
+        # construction restoration and any future load_state_dict use.
+        super().load_state_dict(state_dict, strict=strict, keep_transforms=False)
 
     def store_training(self, x, xa, y, ya, yv, yva, input_transform, outcome_transform):
 
@@ -738,3 +774,161 @@ class MITIM_LinearMeanGradients(gpytorch.means.mean.Mean):
             m.initialize(raw_weights_lin=m.raw_weights_lin_constraint.inverse_transform(value))
         else:
             m.initialize(raw_weights_lin=value)
+
+
+class MITIM_CriticalGradientMean(gpytorch.means.mean.Mean):
+    """
+    Physics-informed flux mean that lets the secondary (x_lcfs-driven) features
+    modulate the diffusivity and the offset:
+
+        flux_mean(x) = sum_j  D_j(s) * g_j   +   b(s)
+        D_j(s)       = softplus(D0_j + d_j . s)        (> 0: diffusive)
+        b(s)         = b0 + c . s
+
+    where the g_j are the driving gradient features (aL*) for this output
+    channel (same channel->gradient mapping as MITIM_LinearMeanGradients) and
+    s = (nuei, tite, beta_e, w0_n, ...) are the non-gradient features that move
+    with the LCFS boundary. D_j(s) carries the interaction (the aL* slope itself
+    changes with collisionality/beta/Ti-Te); b(s) carries the offset shift.
+
+    PARAMETER BUDGET (the reason this is NOT a free generalization of
+    MITIM_LinearMeanGradients): the always-on core is raw_D0 (n_grad) + b0 (1),
+    i.e. 2 params for a single-channel flux GP -- exactly LinearMeanGradients.
+    The secondary terms add d_mod (n_grad*n_sec) and c_sec (n_sec) -- e.g. 8
+    extra for n_grad=1, n_sec=4. At N~5 that WOULD overfit, so two safeguards
+    make the secondary terms "off until earned":
+      1. zero initialization (d_mod=c_sec=0) AND raw_D0 init to softplus^-1(1),
+         so the mean STARTS exactly at the LinearMeanGradients form
+         softplus(D0)*g + b0; the secondary modulation is identically inactive
+         at iteration 0.
+      2. zero-mean Normal shrinkage priors on d_mod and c_sec
+         (secondary_prior_sigma), so the marginal likelihood only moves them off
+         zero when the data (the x_lcfs-spread anchors) actually support it --
+         the effective DOF stays near LinearMeanGradients under scarce data.
+    Either secondary term can also be hard-disabled (enable_interaction /
+    enable_offset); with both off and n_sec absent this is LinearMeanGradients
+    up to the softplus positivity reparam.
+
+    softplus (not a ReLU threshold) keeps the mean smooth in x everywhere, so
+    the in-house GP-posterior Jacobian (mitim_jacobian) used by the weighted-LM
+    solve stays continuous through the mean.
+    """
+
+    def __init__(
+        self,
+        batch_shape=torch.Size(),
+        variables=None,
+        output=None,
+        only_diffusive=True,
+        enable_interaction=False,
+        enable_offset=True,
+        secondary_prior_sigma=0.25,
+        **kwargs,
+    ):
+        super().__init__()
+
+        # --- Driving-gradient indices: identical convention to
+        #     MITIM_LinearMeanGradients so this is a drop-in for TypeMean=2 ---
+        grad_vector = []
+        if variables is not None:
+            if not only_diffusive:
+                for i, variable in enumerate(variables):
+                    if ("aL" in variable) or ("dw" in variable):
+                        grad_vector.append(i)
+            else:
+                mapping = {
+                    "Qe_": "aLte",
+                    "Qi_": "aLti",
+                    "Ge_": "aLne",
+                    "GZ_": "aLnZ",
+                    "Mt_": "dw0dr",
+                    "Qie": None,  # energy exchange: no single driving gradient
+                }
+                for i, variable in enumerate(variables):
+                    if (
+                        output is not None
+                        and mapping.get(output[:3]) is not None
+                        and mapping[output[:3]] == variable
+                    ):
+                        grad_vector.append(i)
+
+        # --- Secondary features = the non-gradient physical features that move
+        #     with x_lcfs: nuei, tite, beta_e, w0_n, ... Exclude ALL gradient-like
+        #     features (any "aL"/"dw" name), not just the driving one: the other
+        #     channels' gradients are x_int design variables, not x_lcfs-driven,
+        #     so they must not enter D(s)/b(s) (would pollute s and burn
+        #     parameters fit from scarce data). ---
+        sec_vector = []
+        if variables is not None:
+            for i, variable in enumerate(variables):
+                if ("aL" in variable) or ("dw" in variable):
+                    continue
+                sec_vector.append(i)
+
+        self.indeces_grad = tuple(grad_vector)
+        self.indeces_sec = tuple(sec_vector)
+        n_grad = len(self.indeces_grad)
+        n_sec = len(self.indeces_sec)
+
+        # Secondary terms only exist if there ARE secondary features (and, for
+        # the interaction, a driving gradient to modulate). Stored as flags so
+        # forward() and the parameter set stay consistent -- no dead placeholders.
+        self.enable_interaction = bool(enable_interaction) and (n_sec > 0) and (n_grad > 0)
+        self.enable_offset = bool(enable_offset) and (n_sec > 0)
+
+        # Always-on core == LinearMeanGradients (raw_D0, b0). raw_D0 init to
+        # softplus^-1(1) = ln(e-1) so softplus(raw_D0)=1 at start (a modest
+        # positive diffusivity; the kernel outputscale absorbs overall scale).
+        self.register_parameter(
+            "raw_D0",
+            torch.nn.Parameter(torch.full((*batch_shape, max(n_grad, 1)), 0.5413248)),
+        )
+        self.register_parameter("b0", torch.nn.Parameter(torch.zeros(*batch_shape, 1)))
+
+        # Secondary coefficients: ZERO init (start at LinearMeanGradients) +
+        # zero-mean Normal shrinkage prior (off until the data earns them).
+        if self.enable_interaction:
+            self.register_parameter(
+                "d_mod", torch.nn.Parameter(torch.zeros(*batch_shape, n_grad, n_sec))
+            )
+            self.register_prior(
+                "d_mod_prior",
+                gpytorch.priors.NormalPrior(0.0, float(secondary_prior_sigma)),
+                "d_mod",
+            )
+        if self.enable_offset:
+            self.register_parameter(
+                "c_sec", torch.nn.Parameter(torch.zeros(*batch_shape, n_sec))
+            )
+            self.register_prior(
+                "c_sec_prior",
+                gpytorch.priors.NormalPrior(0.0, float(secondary_prior_sigma)),
+                "c_sec",
+            )
+
+    def forward(self, x):
+        # x: (*batch, n, n_feat). Return (*batch, n).
+        n_grad = len(self.indeces_grad)
+        s = x[..., self.indeces_sec] if len(self.indeces_sec) > 0 else None
+
+        # Offset b(s) = b0 (+ c . s if enabled)
+        bias = self.b0.unsqueeze(-2)                              # (*b, 1, 1)
+        if self.enable_offset:
+            c = self.c_sec.unsqueeze(-2)                         # (*b, 1, n_sec)
+            bias = bias + (s * c).sum(-1, keepdim=True)          # (*b, n, 1)
+        bias = bias.squeeze(-1)                                   # (*b, n)
+
+        if n_grad == 0:
+            # No driving gradient (e.g. Qie): pure (secondary-)affine offset.
+            return bias
+
+        g = x[..., self.indeces_grad]                            # (*b, n, n_grad)
+
+        # D_j(s) = softplus(D0_j [+ d_j . s])
+        D = self.raw_D0.unsqueeze(-2)                            # (*b, 1, n_grad)
+        if self.enable_interaction:
+            mod = torch.einsum("...ns,...gs->...ng", s, self.d_mod)
+            D = D + mod                                          # (*b, n, n_grad)
+        D = torch.nn.functional.softplus(D)                      # > 0
+
+        return (D * g).sum(-1) + bias                            # (*b, n)

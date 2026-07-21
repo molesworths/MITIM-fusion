@@ -200,7 +200,7 @@ class NEO(SIMtools.mitim_simulation):
 
 
 
-    def run_vgen(self, subfolder="vgen1", vgenOptions={}, cold_start=False):
+    def run_vgen(self, subfolder="vgen1", vgenOptions={}, cold_start=False, numcores=None):
 
         self.folder_vgen = self.folder / f"{subfolder}"
 
@@ -211,6 +211,9 @@ class NEO(SIMtools.mitim_simulation):
         vgenOptions.setdefault("numspecies", len(self.inputgacode.Species))
         vgenOptions.setdefault("matched_ion", 1)
         vgenOptions.setdefault("nth", "17,39")
+        # numcores=None => serial `profiles_gen -vgen` (no -n): the reliable form.
+        # An -n larger than the host supports can hang the launch. Pass an int to
+        # request MPI ranks explicitly.
 
         # ---- Prepare
 
@@ -238,7 +241,8 @@ class NEO(SIMtools.mitim_simulation):
 
         if runThisCase:
             file_new = GACODErun.runVGEN(
-                self.folder_vgen, vgenOptions=vgenOptions, name_run=subfolder
+                self.folder_vgen, vgenOptions=vgenOptions, name_run=subfolder,
+                numcores=numcores,
             )
         else:
             print(f"\t- Required files found in {subfolder}, not running VGEN",typeMsg="i",)

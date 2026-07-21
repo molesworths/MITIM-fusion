@@ -39,13 +39,6 @@ Add an ``edge_options`` block alongside the standard ``solution`` block:
       # of one GP per rhoCP. Adds magnetic shear as a radial-location feature and pools the
       # samples from all rhoCP (converted to gyro-Bohm space) into each turbulent GP.
       global_surrogates : false
-
-    # Optional: edge-UQ uncertainty inflation (applied inside powerstate_edge)
-    edge_uq_enable              : true
-    edge_uq_calib_dir           : ./results_offline_edge_uq
-    edge_uq_calib_label         : baseline
-    edge_uq_scale_factor        : 1.0
-    # edge_uq_channel_mapping: {bc_ne: ne, bc_te: te}  # optional
 """
 
 import copy
@@ -70,10 +63,8 @@ def _dv_name_for_parameterizer(parameterizer_name, channel, index, defined_on=No
         param_names = ["log_A", "log_u1", "delta", "m"]
         if 1 <= index <= len(param_names):
             return f"{channel}_{param_names[index - 1]}"
-    if parameterizer_name in {"SplineMtanh", "spline_mtanh", "mtanh_spline", "MtanhSpline"}:
-        if defined_on == "dy":
-            return f"d{channel}_{index}"
-        return f"aL{channel}_{index}"
+    if defined_on == "dy":
+        return f"d{channel}_{index}"
     return f"aL{channel}_{index}"
 
 
@@ -455,28 +446,6 @@ def initializeProblem(
                 ]
 
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Soft-prior LCFS aLy degrees of freedom (lcfs_bc_model.md section 6)
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-    # Each LCFS aLy DV is appended *after* all interior knot DVs so that
-    # powerstate_edge.X_to_dict consumes the interior columns first and the
-    # trailing columns map (in order) onto powerstate.lcfs_dv_channels.
-    portals_fun._lcfs_dv_names = []
-    if getattr(portals_fun.powerstate, "_lcfs_dv_enabled", False):
-        lcfs_range = float(edge_options.get("lcfs_dv_range", 0.5))  # relative half-width
-        for ch in portals_fun.powerstate.lcfs_dv_channels:
-            prior = portals_fun.powerstate.lcfs_prior.get(ch, None)
-            if prior is not None and prior.numel() > 0:
-                base_val = _as_tensor_on(dfT, float(prior.reshape(-1)[0].item()))
-            else:
-                base_val = _as_tensor_on(dfT, 1.0)
-            scale = max(abs(float(base_val.item())), 1e-3)
-            y1 = _as_tensor_on(dfT, max(0.0, float(base_val.item()) - lcfs_range * scale))
-            y2 = base_val + lcfs_range * scale
-            name = f"aL{ch}_lcfs"
-            dictDVs[name] = [y1, base_val, y2]
-            portals_fun._lcfs_dv_names.append(name)
-
-    # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     # Define output dictionaries
     # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -703,6 +672,45 @@ def runModelEvaluator_edge(
     powerstate.transport_options["cold_start"] = cold_start
     powerstate.calculate(X, nameRun=name, folder=folder_model, evaluation_number=numPORTALS)
 
+    # Edge-UQ: propagate fixed-input uncertainty through the model IN-LOOP.  The
+    # flux GP maps deterministic features (aLne/aLte/aLti/nuei/tite/betae) -> flux
+    # with ~0 irreducible noise, so by default (inject_training_stds=False) the
+    # propagated input std does NOT pollute the OF "{flux}_stds" that become the
+    # surrogate GP TRAINING noise -- it is kept as the objective-level products
+    # (sigma_J / robust_objective / Sigma_r on self._edge_uq_last) plus diagnostic
+    # "{key}_uq_std" profile bands.  Opt-in via self._edge_uq_inputs (a UQInputs);
+    # optional self._edge_uq_options dict forwards run_edge_uq kwargs (set
+    # inject_training_stds=True there for the legacy training-noise inflation).
+    #
+    # Gated to the OPTIMIZATION phase: during initial training there are no flux/
+    # target surrogates for the UQ forward to use, so it only fires once
+    # numPORTALS >= start_after_eval (defaults to the initial_training count).
+    uq_inputs = getattr(self, "_edge_uq_inputs", None)
+    if uq_inputs is not None:
+        uq_opts = dict(getattr(self, "_edge_uq_options", {}) or {})
+        uq_opts.pop("inject_into", None)        # the hook owns the injection target
+        start_after = uq_opts.pop("start_after_eval", None)
+        if start_after is None:
+            try:
+                start_after = int(self.optimization_options
+                                  ["initialization_options"]["initial_training"])
+            except Exception:
+                start_after = 0
+        if numPORTALS < start_after:
+            print(f"[PORTALSedge] edge-UQ skipped at eval {numPORTALS} "
+                  f"(training phase, < {start_after})", typeMsg="i")
+        else:
+            try:
+                from mitim_tools.edge_tools.uq.run import run_edge_uq
+                self._edge_uq_last = run_edge_uq(
+                    powerstate, uq_inputs, X_dvs=X, inject_into=powerstate, **uq_opts
+                )
+                if not hasattr(self, "_edge_uq_history"):
+                    self._edge_uq_history = []
+                self._edge_uq_history.append((int(numPORTALS), self._edge_uq_last))
+            except Exception as exc:  # never let UQ break the model evaluation
+                print(f"[PORTALSedge] edge-UQ injection skipped ({exc})", typeMsg="w")
+
     if dictOFs is not None:
         proxy_powerstate = copy.copy(powerstate)
         proxy_powerstate.plasma = powerstate._slice_plasma_to_rhoCP(pad_zero=True)
@@ -892,20 +900,6 @@ class portals_edge(portals):
             remove_folder_upon_completion=not self.portals_parameters["solution"]["keep_full_model_folder"],
         )
 
-        # Section 6: refresh the LCFS soft-prior means F_y (and per-channel
-        # sigma_y) on the template powerstate from this real evaluation, so the
-        # optimizer (wLM _append_lcfs_prior_rows / BO _lcfs_residual_source)
-        # priors track the LCFS state — the small per-iteration refinements of
-        # the BC-model prediction. The evaluator deep-copies the template, so
-        # this template field is otherwise frozen at its initialization value.
-        if getattr(self.powerstate, "_lcfs_dv_enabled", False) and hasattr(powerstate_result, "lcfs_prior"):
-            self.powerstate.lcfs_prior = {
-                k: (v.detach().clone() if hasattr(v, "detach") else v)
-                for k, v in powerstate_result.lcfs_prior.items()
-            }
-            if hasattr(powerstate_result, "lcfs_sigma"):
-                self.powerstate.lcfs_sigma = dict(powerstate_result.lcfs_sigma)
-
         # 4. Write results (unchanged)
         self.write(dictOFs, resultsfile)
 
@@ -928,11 +922,8 @@ class portals_edge(portals):
         -----
                 - Y is the multi-output evaluation of the model in the shape of (dim1...N, num_ofs), i.e. this function should not care
                   about number of dimensions
-                - X (optional) is the design vector (dim1...N, num_dvs). When provided
-                  and LCFS soft-prior DVs are active, the analytic boundary-condition
-                  residuals R_LCFS,y = (y - F_y)/sigma_y are appended to the flux
-                  residual vector (lcfs_bc_model.md section 6). F_y / sigma_y are
-                  constants per BO step taken from the powerstate prior.
+                - X (optional) is the design vector (dim1...N, num_dvs); unused here,
+                  kept for signature compatibility with the base optimizer.
         """
 
         ofs_ordered_names = np.array(self.optimization_options["problem_options"]["ofs"])
@@ -971,65 +962,23 @@ class portals_edge(portals):
 
         of, cal, source, res = PORTALStools.calculate_residuals(proxy_powerstate, self.portals_parameters,specific_vars=var_dict)
 
-        # -------------------------------------------------------------------------
-        # Section 6: append analytic LCFS soft-prior residuals R_LCFS,y=(y-F_y)/sigma
-        # -------------------------------------------------------------------------
-        lcfs_source = self._lcfs_residual_source(X, source)
-        if lcfs_source is not None:
-            source = torch.cat((source, lcfs_source), dim=-1)
-            res = -1.0 / source.shape[-1] * torch.norm(source, p=2, dim=-1)
+        # Target-normalized (dimensionless) objective. Required by the ne->Ge
+        # ("particle") flux channel: the ne residual is then in 10^20/m^2/s while
+        # Qe/Qi are in MW/m^2, so the ABSOLUTE residual cal - of mixes units and the
+        # raw-magnitude channel dominates. Dividing each channel's of/cal by its
+        # target |cal| makes the residual (cal-of)/cal -- dimensionless and per-
+        # channel commensurate -- which both the BO objective (res) and CALM (it
+        # recomputes cal - of from these of/cal) then inherit. No-op for the default
+        # convective (Ce) channel, where all channels already share MW/m^2 units and
+        # the absolute total-power objective is the intended one.
+        if getattr(self.powerstate, "targets_normalized", False):
+            ref = cal.abs()
+            floor = ref.amax(dim=-1, keepdim=True) * 1e-3 + 1e-30
+            ref = torch.clamp(ref, min=floor)
+            of, cal = of / ref, cal / ref
+            res = -1.0 / cal.shape[-1] * torch.norm(cal - of, p=2, dim=-1)
 
         return of, cal, res
-
-    def _lcfs_residual_source(self, X, ref):
-        """
-        Build the LCFS soft-prior residual block (y - F_y)/sigma_y as extra
-        components of the residual vector, broadcast to match ``ref`` (the flux
-        ``source`` tensor) leading dimensions.
-
-        Returns None when X is unavailable or no LCFS DVs are active.
-        """
-        if X is None:
-            return None
-        names = getattr(self, "_lcfs_dv_names", []) or []
-        if not names:
-            return None
-        powerstate = self.powerstate
-        prior = getattr(powerstate, "lcfs_prior", {}) or {}
-        sigma = getattr(powerstate, "lcfs_sigma", {}) or {}
-
-        dv_names = self.optimization_options["problem_options"]["dvs"]
-        X = torch.as_tensor(X).to(ref)
-
-        cols = []
-        for name in names:
-            if name not in dv_names:
-                continue
-            ch = name[len("aL"):-len("_lcfs")]
-            if ch not in prior or prior[ch].numel() == 0:
-                continue
-            idx = dv_names.index(name)
-            y_dv = X[..., idx]
-            Fy = float(prior[ch].reshape(-1)[0].item())
-            # sigma_y is a per-channel *relative* trust; convert to absolute aLy
-            # units against the prior mean so it matches the wLM weighting
-            # (Sigma = (sigma_rel*|F_y|)^2) exactly.
-            sy = max(float(sigma.get(ch, 0.15)) * abs(Fy), 1e-6)
-            cols.append(((y_dv - Fy) / sy).unsqueeze(-1))
-
-        if not cols:
-            return None
-        lcfs = torch.cat(cols, dim=-1)
-
-        # During MC acquisition botorch passes ``X`` with shape
-        # (batch, q, d) while ``ref`` (the flux ``source``) carries an extra
-        # leading sample dimension (sample_shape, batch, q, N). Broadcast the
-        # LCFS residual block onto ref's leading dims so the subsequent
-        # torch.cat along the residual axis is shape-consistent.
-        lead = torch.broadcast_shapes(ref.shape[:-1], lcfs.shape[:-1])
-        lcfs = lcfs.expand(*lead, lcfs.shape[-1])
-        return lcfs
-
 
 
 def calculate_residuals(powerstate, portals_parameters, specific_vars=None):

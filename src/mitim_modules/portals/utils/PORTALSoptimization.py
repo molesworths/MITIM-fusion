@@ -84,32 +84,6 @@ def initialization_simple_relax(self):
     X = torch.from_numpy(self.optimization_options["problem_options"]["dvs_base"]).to(self.dfT).unsqueeze(0)
     powerstate.modify(X)
 
-    # ------------------------------------------------------------------------------------
-    # LCFS DV variation schedule for initial training.
-    # The relaxation trajectory becomes the initial training set; if the LCFS DVs are
-    # held at their prior throughout, every point has R_LCFS = 0 and the GP sees no
-    # flux sensitivity to them, so the optimizer never nudges them. Sweep the LCFS DVs
-    # across their bounds (LHS, row 0 = nominal/base) so each trajectory point carries
-    # a distinct LCFS value with a valid real-model flux — at no extra evaluation cost.
-    # ------------------------------------------------------------------------------------
-    if getattr(powerstate, "_lcfs_dv_enabled", False) and getattr(powerstate, "lcfs_dv_channels", None):
-        dvs = list(self.optimization_options["problem_options"]["dvs"])
-        dvs_min = np.asarray(self.optimization_options["problem_options"]["dvs_min"], dtype=float)
-        dvs_max = np.asarray(self.optimization_options["problem_options"]["dvs_max"], dtype=float)
-        dvs_base = np.asarray(self.optimization_options["problem_options"]["dvs_base"], dtype=float)
-        lcfs_idx = [dvs.index(f"aL{ch}_lcfs") for ch in powerstate.lcfs_dv_channels if f"aL{ch}_lcfs" in dvs]
-        N = int(self.Originalinitial_training)
-        if lcfs_idx and N > 1:
-            d = len(lcfs_idx)
-            lo, hi = dvs_min[lcfs_idx], dvs_max[lcfs_idx]
-            rng = np.random.default_rng(self.seed if self.seed else 0)
-            M = N - 1
-            lhs = np.zeros((M, d))
-            for j in range(d):
-                lhs[:, j] = (rng.permutation(M) + rng.random(M)) / M
-            sched = np.vstack([dvs_base[lcfs_idx][None, :], lo[None, :] + lhs * (hi - lo)[None, :]])
-            powerstate._lcfs_init_schedule = torch.from_numpy(sched).to(self.dfT)
-
     # Flux matching process
 
     powerstate.flux_match(
@@ -548,8 +522,7 @@ def monotonicity_inequality_constraints(portals_obj, eps=0.0):
 
     BoTorch expresses each constraint as ``sum(coeff * X[idx]) >= rhs``, so a
     pair (i_lo, i_hi) maps to ``([i_lo, i_hi], [-1.0, 1.0], eps)``. Pairs come
-    from the shared ``build_monotonicity_pairs`` helper (the same source the wLM
-    soft-monotonicity QP uses), which already excludes ``_lcfs`` boundary DVs.
+    from the shared ``build_monotonicity_pairs`` helper.
 
     Constraints are written in the physical DV coordinates the BO optimizer
     searches (``bounds_mod`` is not normalized), so no rescaling is needed.

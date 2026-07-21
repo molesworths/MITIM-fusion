@@ -475,12 +475,11 @@ class AuroraChargeStates(ChargeStateModel):
         p["nu_scd_imp"][b]  = nu_scd_t
         p["nu_acd_imp"][b]  = nu_acd_t
 
-        # Charge-balance update of main ion density
-        if self.update_ni:
-            self._update_ni_charge_balance(powerstate, b, nz_tensor)
-
-        # Keep Zeff consistent with the latest ni / ne state.
-        self._update_zeff(powerstate, b)
+        # NOTE: quasineutrality (ni main-ion closure) and Zeff are NOT applied here.
+        # They are owned by powerstate_edge._enforce_quasineutrality(), which runs after
+        # EITHER impurity source -- this model's nz_all, or the parameterizer's aLnZ -> nZ --
+        # and reads the impurity charge moments from a single source so QN and Zeff cannot
+        # disagree. Charge-state models produce nz_all / radiation / rates only.
 
     # ------------------------------------------------------------------
 

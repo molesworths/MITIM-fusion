@@ -382,7 +382,11 @@ def runVGEN(
     )
     print(f"\t\t> Matching ion {vgenOptions['matched_ion']} Vtor")
 
-    options = f"-er {vgenOptions['er']} -vel {vgenOptions['vel']} -in {vgenOptions['numspecies']} -ix {vgenOptions['matched_ion']} -nth {vgenOptions['nth']}"
+    options = f"-er {vgenOptions['er']} -vel {vgenOptions['vel']} -in {vgenOptions['numspecies']} -ix {vgenOptions['matched_ion']}"
+    # -nth is optional; omit when not requested (matches the reliable serial recipe).
+    nth = vgenOptions.get('nth', None)
+    if nth:
+        options += f" -nth {nth}"
 
     # ***********************************
 
@@ -394,9 +398,15 @@ def runVGEN(
 
     _, nameFile = IOtools.reducePathLevel(inputgacode_file, level=1, isItFile=True)
 
+    # -n (MPI ranks) is optional; omit for a serial run. An -n larger than the
+    # host supports can hang the launch, so only add it when numcores is truthy.
+    run_cmd = f"profiles_gen -vgen -i {nameFile} {options}"
+    if numcores:
+        run_cmd += f" -n {numcores}"
+
     command = f"cd {vgen_job.machineSettings['folderWork']} && bash profiles_vgen.sh"
     with open(workingFolder / f"profiles_vgen.sh", "w") as f:
-        f.write(f"profiles_gen -vgen -i {nameFile} {options} -n {numcores}")
+        f.write(run_cmd)
 
     # ---------------
     # Execute
