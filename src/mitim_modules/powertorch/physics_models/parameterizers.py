@@ -1509,7 +1509,11 @@ class SplineMtanhAnalytic(ParameterBase):
     _Y_FLOOR = 1e-12
     _PENALTY = 1e3
     _S_BOUNDS = (1e-3, 0.999)
-    _W1_BOUNDS = (1e-3, 0.1)
+    # Foot width w1 = w(x0). Physical range: below ~0.01 the tanh foot is a razor-thin
+    # spike (a flat interior with a steep last-knot jump used to collapse w1 to ~0.006 and
+    # send the sub-separatrix aLy to ~10x its neighbours); above ~0.1 the "foot" is wider
+    # than the pedestal. Bounding [0.01, 0.1] keeps every reconstruction physical.
+    _W1_BOUNDS = (0.01, 0.1)
     _RHO_BOUNDS = (0.0, 0.999)
     _R_SAFETY = 0.999                        # rho=1 hits u'(x0)=0 exactly; stay just inside
     _C_BOUNDS = (0.9, 1.1)
@@ -1556,9 +1560,30 @@ class SplineMtanhAnalytic(ParameterBase):
         self.c_seed_hi = float(options.get('c_seed_hi', 1.15))
         self.c_seed_mid = float(options.get('c_seed_mid', 0.95))
         self.c_seed_p = float(options.get('c_seed_p', 2.0))
+        # Interior-knot residual corrector. ON by default: the analytic mtanh is not
+        # guaranteed to hit the requested aLy knots (up to ~10-18% off on non-mtanh
+        # interior shapes), so Delta(x) pins them exactly. Set use_corrector=False to
+        # report the BARE mtanh backbone (knots then only approximately matched via the
+        # fit theta) -- the tail-peak guard + w1 bound still apply to the backbone, so
+        # the reported profile stays physical. NB with the corrector off the aLy-knot
+        # DVs enter only through the (detached) fit, so the straight-through torch DV
+        # gradient vanishes (the solver's FD-through-parameterizer path is unaffected).
+        self.use_corrector = bool(options.get('use_corrector', True))
         # Fixed defaults for the non-c solver components.
         self.s0 = float(options.get('s0', 0.5))
         self.w1_0 = float(options.get('w1_0', 0.02))
+        # Runaway tail-peak guard. A flat interior with a steep last-knot/LCFS jump can
+        # make the mtanh backbone overshoot inside (0.97,1) to many x its neighbours
+        # (e.g. aLne ~100 with knots ~20) even at the physical w1 floor. When the fitted
+        # backbone peak exceeds fit_peak_kappa * max(aLy(last knot), aLy(1)), a single
+        # penalized LM re-fit (soft ReLU on the excess at fit_peak_x) pulls it back under
+        # the cap. Gated on detection -> real, non-runaway fits never re-fit (byte-identical)
+        # and pay only one cheap peak evaluation. The corrector still pins the interior
+        # knots, so the re-fit only reshapes the over-peaked tail.
+        self._peak_penalty_on = bool(options.get('fit_peak_penalty', True))
+        self.fit_peak_kappa = float(options.get('fit_peak_kappa', 2.0))
+        self.fit_peak_weight = float(options.get('fit_peak_weight', 5.0))
+        self._peak_x = np.linspace(0.971, 0.998, 8)
         # Theta stashed by the most recent _resolve, keyed by profile; the torch
         # overlay reads s from here to keep A live in the BCs (see below).
         self._current_theta: Dict[str, np.ndarray] = {}
@@ -1892,7 +1917,7 @@ class SplineMtanhAnalytic(ParameterBase):
     # ------------------------------------------------------------------
     # Analytic-Jacobian interior fit
     # ------------------------------------------------------------------
-    def _resid_jac(self, theta, x_k, aLy_k, y_bc, aLy_bc, scale):
+    def _resid_jac(self, theta, x_k, aLy_k, y_bc, aLy_bc, scale, peak_cap=None):
         s, c, w1, rho = (float(v) for v in theta)
         r, dr_drho, dr_dc = self._rho_c_to_r(rho, c)
         with np.errstate(over="ignore", invalid="ignore"):
@@ -1906,6 +1931,22 @@ class SplineMtanhAnalytic(ParameterBase):
             # when #knots<4 and is neutral on peaking once the knots demand it.
             res = np.concatenate([res, [self.lam_r * rho]])
             J = np.concatenate([J, [[0.0, 0.0, 0.0, self.lam_r]]], axis=0)
+        if peak_cap is not None:
+            # Runaway-tail penalty (only threaded in on the spike-guard re-fit): a
+            # one-sided ReLU on the fractional overshoot of aLy above peak_cap at the
+            # tail sample points. Rows are 0 (and drop out of J^TJ) wherever the backbone
+            # is already under the cap, so the penalty only pulls down an over-peaked foot.
+            with np.errstate(over="ignore", invalid="ignore"):
+                _, aLy_p, ds_p, dc_p, dw_p, dr_p = _pedestal_eval_all(
+                    self._peak_x, s, c, w1, r, self.x0, y_bc, aLy_bc)
+            excess = (aLy_p - peak_cap) / peak_cap
+            active = excess > 0.0
+            pen = self.fit_peak_weight * np.where(active, excess, 0.0)
+            Jp = (self.fit_peak_weight / peak_cap) * np.stack(
+                [ds_p, dc_p + dr_p * dr_dc, dw_p, dr_p * dr_drho], axis=-1)
+            Jp[~active] = 0.0
+            res = np.concatenate([res, pen])
+            J = np.concatenate([J, np.nan_to_num(Jp)], axis=0)
         return res, J
 
     def _interior_maxrel_theta(self, theta, x_k, aLy_k, y_bc, aLy_bc) -> float:
@@ -1916,14 +1957,23 @@ class SplineMtanhAnalytic(ParameterBase):
         rel = np.abs(aLy_val - aLy_k) / np.maximum(np.abs(aLy_k), 1e-3)
         return float(np.max(rel)) if rel.size else np.inf
 
-    def _lm_solve(self, seed, x_k, aLy_k, y_bc, aLy_bc, scale, lo, hi):
+    def _tail_peak(self, theta, y_bc, aLy_bc) -> float:
+        """Max backbone aLy over the (0.97,1) tail sample points -- the quantity the
+        runaway guard caps. Cheap (one _pedestal_eval_all on ~8 points)."""
+        s, c, w1, rho = (float(v) for v in theta)
+        r, _, _ = self._rho_c_to_r(rho, c)
+        with np.errstate(over="ignore", invalid="ignore"):
+            _, aLy_p, *_ = _pedestal_eval_all(self._peak_x, s, c, w1, r, self.x0, y_bc, aLy_bc)
+        return float(np.max(aLy_p)) if aLy_p.size else 0.0
+
+    def _lm_solve(self, seed, x_k, aLy_k, y_bc, aLy_bc, scale, lo, hi, peak_cap=None):
         """Bounded Levenberg-Marquardt on the analytic-Jacobian residual. No scipy
         overhead (that was ~7.7 ms/solve): the 4x4 normal-equation solve + a handful
         of ``_resid_jac`` (~0.2 ms) evaluations converge a warm start in 1-2 outer
         iterations -> O(1 ms) fits. Deterministic (fixed iteration/damping caps, no
         randomness). Returns (theta, cost)."""
         theta = np.clip(np.asarray(seed, dtype=float).reshape(-1)[:4], lo, hi)
-        r, J = self._resid_jac(theta, x_k, aLy_k, y_bc, aLy_bc, scale)
+        r, J = self._resid_jac(theta, x_k, aLy_k, y_bc, aLy_bc, scale, peak_cap)
         r = np.nan_to_num(r); J = np.nan_to_num(J)
         cost = float(r @ r)
         lam = 1e-3
@@ -1947,7 +1997,7 @@ class SplineMtanhAnalytic(ParameterBase):
                 except np.linalg.LinAlgError:
                     break
                 thn = np.clip(theta + dth, lo, hi)
-                rn, Jn = self._resid_jac(thn, x_k, aLy_k, y_bc, aLy_bc, scale)
+                rn, Jn = self._resid_jac(thn, x_k, aLy_k, y_bc, aLy_bc, scale, peak_cap)
                 rn = np.nan_to_num(rn)
                 cn = float(rn @ rn)
                 if cn < cost:                       # accept -> lower damping
@@ -2008,6 +2058,21 @@ class SplineMtanhAnalytic(ParameterBase):
             if best_theta is None:
                 best_theta = self._default_theta0(aLy_k, aLy_bc)
             best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
+
+        # Runaway tail-peak guard (detection-gated -> no cost/perturbation on well-behaved
+        # fits). If the fitted backbone overshoots the cap in (0.97,1), do ONE penalized LM
+        # re-fit seeded at the current theta and adopt it only if it actually lowers the
+        # peak. best_r/best_J are recomputed WITHOUT the penalty rows so the UQ covariance
+        # stays the honest data-fit covariance.
+        if self._peak_penalty_on and aLy_k.size:
+            ref = max(float(aLy_k[-1]), float(aLy_bc))
+            cap = self.fit_peak_kappa * ref
+            if self._tail_peak(best_theta, y_bc, aLy_bc) > cap:
+                th_pen, _, _, _ = self._lm_solve(best_theta, x_k, aLy_k, y_bc, aLy_bc,
+                                                 scale, lo, hi, peak_cap=cap)
+                if self._tail_peak(th_pen, y_bc, aLy_bc) < self._tail_peak(best_theta, y_bc, aLy_bc):
+                    best_theta = th_pen
+                    best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
 
         # Fit-parameter covariance for UQ: Cov(theta) = sigma^2 (J^T J)^-1 at the
         # solution, with sigma^2 = SSR / dof.  theta = {s, c, w1, rho}; the analytic
@@ -2157,6 +2222,14 @@ class SplineMtanhAnalytic(ParameterBase):
         y_bc = y_bc.to(x_t); aLy_bc = aLy_bc.to(x_t)
         # backbone at the eval grid and at the knots (torch, live in BCs; shape detached)
         y_base, aLy_base = self._eval_once_torch_s((A, D0, delta, c), s, y_bc, aLy_bc, x_t)
+        if not self.use_corrector:
+            # Bare backbone: no interior-knot pinning, so the DVs enter only through the
+            # detached fit -> live gradient is BC-only (matches the numpy value).
+            y = torch.clamp(y_base, min=0.0)
+            aLy = torch.clamp(aLy_base, min=0.0)
+            if not (torch.all(torch.isfinite(y)) and torch.all(torch.isfinite(aLy))):
+                return None
+            return y, aLy
         kt = torch.as_tensor(np.asarray(self.knots, dtype=float)).to(x_t)
         _, model_k = self._eval_once_torch_s((A, D0, delta, c), s, y_bc, aLy_bc, kt)
         # linear corrector Delta = B @ resid (resid live in DVs); B constant (cached)
@@ -2226,7 +2299,9 @@ class SplineMtanhAnalytic(ParameterBase):
         boundary conditions are preserved by the superposition.
         """
         n = len(self.knots)
-        if n == 0:
+        if n == 0 or not self.use_corrector:
+            # use_corrector=False -> return None so _corrected_profile reports the bare
+            # mtanh backbone (interior knots matched only through the fit theta).
             return None
         if isinstance(prof_params, dict):
             target = np.array([float(prof_params[name]) for name in self.param_names], dtype=float)

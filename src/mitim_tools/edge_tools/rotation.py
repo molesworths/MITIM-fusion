@@ -230,6 +230,10 @@ def calculate_rotation(
     vtor=None,      # (batch, rho) imposed toroidal velocity [m/s]; None = vtor=0 closure
     w0_override=None,  # (batch, rho) externally supplied w0 [rad/s] (e.g. NEO vgen);
                        # bypasses the analytic Er and just builds the shear variants
+    return_fine=False,  # attach out["_fine"] = {"roa", "gamma_exb", "tau_norm"} on the
+                        # oversampled grid (consumers: edge_tools.nonlocality kernel
+                        # integrals, which need the well structure resolved BEFORE any
+                        # interpolation back to the coarse grid)
 ):
     """Compute all E×B rotation quantities from the current profiles.
 
@@ -268,8 +272,12 @@ def calculate_rotation(
             w0_override=(None if w0_override is None else up(w0_override)),
         )
         # Sample the (smooth) rotation outputs back onto the caller's grid.
-        return {k: cubic_interp(roa_f, v, roa1d) if v.shape[-1] == roa_f.shape[0] else v
-                for k, v in out_f.items()}
+        out = {k: cubic_interp(roa_f, v, roa1d) if v.shape[-1] == roa_f.shape[0] else v
+               for k, v in out_f.items()}
+        if return_fine:
+            out["_fine"] = {"roa": roa_f, "gamma_exb": out_f["gamma_exb"],
+                            "tau_norm": out_f["tau_norm"]}
+        return out
 
     dtype, device = ti_keV.dtype, ti_keV.device
     if Z_main is None:
@@ -329,6 +337,17 @@ def calculate_rotation(
         small = mach ** 2 < mach_cut2
         gamma_p = torch.where(small, torch.zeros_like(gamma_p), gamma_p)
         mach = torch.where(small, torch.zeros_like(mach), mach)
+
+    if return_fine:
+        # oversample <= 1: the native grid IS the finest available; expose it
+        # under the same key so consumers are oversample-agnostic.
+        return {
+            "w0": w0, "Er": Er, "E_rad": E_rad, "vexb": vexb,
+            "gamma_exb": gamma_exb, "vexb_shear": vexb_shear,
+            "gamma_p": gamma_p, "mach": mach, "w0_n": w0_n,
+            "aLw0_n": aLw0_n, "tau_norm": tau_norm,
+            "_fine": {"roa": roa1d, "gamma_exb": gamma_exb, "tau_norm": tau_norm},
+        }
 
     return {
         "w0": w0,
@@ -531,12 +550,22 @@ def resolve_vtor_powerstate(ps, inputs=None):
     Controlled by ``ps._rotation_options["vtor_source"]``:
         "zero" (default) : no imposed toroidal rotation.
         "user"           : interpolate ``vtor_pairs=[(rho, vtor_m_s), ...]``.
-        "extract_initial": capture Vtor once from the input profiles and hold it
-                           fixed (cached on ``ps._vtor_extracted``). A ``vtor(m/s)``
-                           main-ion block is used directly; otherwise the residual
-                           fluid Vtor is backed out of the initial force balance
-                           from ``w0(rad/s)``:  Vtor = (Er_init - Er_closure) / Bp,
-                           Er_init = w0_input * R * Bp, Er_closure = vtor=0 closure.
+        "extract_initial": capture Vtor from the input profiles and hold it fixed.
+                           A ``vtor(m/s)`` main-ion block is used directly; otherwise
+                           the residual fluid Vtor is backed out of the INITIAL force
+                           balance from ``w0(rad/s)``: Vtor = (Er_init - Er_closure)/Bp,
+                           Er_init = w0_input * R * Bp, and Er_closure = the vtor=0
+                           closure Er evaluated on the *initial* ni/ti profiles (NOT
+                           the current DV-updated ones -- see the body). This makes
+                           Vtor a fixed property of the discharge, so w0 = Er/(R Bp)
+                           then evolves with the diamagnetic Er as the profiles change.
+                           ``vtor_extract_smooth`` (int, default 5): odd window in
+                           plasma-grid points to smooth the backed-out Vtor at the
+                           pedestal foot (only the w0 back-out path; the difference of
+                           two steep fields wiggles there). Width = window*drho and the
+                           edge grid is drho~0.005, so window~5-7 is the useful range;
+                           >~9 starts eroding the pedestal-top vexb_shear. Set <= 1 to
+                           disable.
     """
     opts = getattr(ps, "_rotation_options", {}) or {}
     src = opts.get("vtor_source", "zero")
@@ -587,9 +616,64 @@ def resolve_vtor_powerstate(ps, inputs=None):
         Er_init = w0_input * R * Bp
         if inputs is None:
             inputs = ps._rotation_inputs()
-        # vtor=0 closure Er (diamagnetic + neoclassical poloidal), detached.
-        Er_closure = calculate_rotation(**inputs, vtor=None)["Er"].detach()
-        ps._vtor_extracted = (Er_init - Er_closure) / Bp
+
+        # The residual fluid Vtor is a FIXED property of the discharge and must be
+        # backed out of the INITIAL force balance. Build the vtor=0 closure Er from
+        # the initial-gacode ni/ti/te (interpolated onto the plasma grid), keeping
+        # the fixed geometry and K_neo/oversample settings from `inputs`. Only ni
+        # and ti enter Er (te / c_s affect downstream normalizations only), but all
+        # profile fields are overridden for clarity/robustness.
+        #
+        # Using the *current* (DV-updated) plasma profiles here instead is a bug: the
+        # back-out then tunes Vtor to reproduce Er_init exactly on every evaluation
+        # (Er = Er_closure_current + (Er_init - Er_closure_current) = Er_init), which
+        # freezes w0 at the input value regardless of how the profiles evolve. The
+        # per-instance `_vtor_extracted` cache does not save this, because the
+        # flux-match rebuilds the powerstate every evaluation, so the extraction
+        # re-runs against the then-current profiles each time.
+        def _interp_init(col):
+            col = np.asarray(col).reshape(-1)
+            return torch.from_numpy(
+                np.vstack([np.interp(rho_np[b], rho_src, col) for b in range(batch)])
+            ).to(ps.dfT)
+
+        init_inputs = dict(inputs)
+        init_inputs["ni_m3"] = _interp_init(np.asarray(prof["ni(10^19/m^3)"])[:, 0]) * 1e19
+        init_inputs["ti_keV"] = _interp_init(np.asarray(prof["ti(keV)"])[:, 0])
+        init_inputs["te_keV"] = _interp_init(prof["te(keV)"])
+        if "z_eff(-)" in prof:
+            init_inputs["Zeff"] = _interp_init(prof["z_eff(-)"])
+
+        # vtor=0 closure Er (diamagnetic + neoclassical poloidal) from the INITIAL
+        # profiles, detached.
+        Er_closure = calculate_rotation(**init_inputs, vtor=None)["Er"].detach()
+        vtor_extracted = (Er_init - Er_closure) / Bp
+
+        # Optional foot smoothing. The back-out is (Er_init - Er_closure): a
+        # difference of two steep fields, so it inherits grid-scale wiggle at the
+        # pedestal foot even though the true toroidal rotation is smooth (cf. the
+        # smooth measured impurity vtor). Vtor is an imposed, DETACHED field, so
+        # smoothing the RESULT is a safe regularization -- it does not touch the
+        # profiles the diamagnetic Er differentiates, and w0 = Er/(R Bp) still
+        # evolves self-consistently with them.
+        #
+        # Window is in plasma-grid POINTS (odd, reflect-padded), so its physical
+        # width is window * drho. The edge plasma grid is built at drho ~ 0.005
+        # (STATEedge, linspace step 0.005), so a useful smooth spans ~0.025-0.035
+        # in rho, i.e. window ~ 5-7; window=3 (~0.015) is too narrow to remove the
+        # foot oscillation on that grid. Larger windows (>~9) begin eroding the
+        # physical pedestal-top dVtor/dr that carries the vexb_shear you keep, so
+        # do NOT over-smooth: the peak vexb_shear near the flux-match boundary is
+        # itself a steep Vtor gradient sitting right next to the wiggle. Note this
+        # makes iter-0 w0 depart from the input w0 at the foot by
+        # (Vtor_smoothed - Vtor_raw)/R: an explicit assertion that the smooth Vtor
+        # is more trustworthy there than the noisy difference. Defaults to 5
+        # (~0.025 in rho on the drho~0.005 edge grid); set <= 1 to disable.
+        win = int(opts.get("vtor_extract_smooth", 5))
+        if win > 1:
+            vtor_extracted = smooth(vtor_extracted, window=win)
+
+        ps._vtor_extracted = vtor_extracted
         return ps._vtor_extracted
 
     raise ValueError(f"[rotation] unknown vtor_source {src!r}")

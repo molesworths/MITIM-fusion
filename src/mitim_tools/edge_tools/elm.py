@@ -126,7 +126,7 @@ class ElmStability:
     """Abstract base for ELM stability models."""
 
     def __init__(self, options: dict):
-        self.verbose = options.get("verbose", False)
+        self.verbose = options.get("verbose", True)
         self.elm_factor: torch.Tensor | None = None   # (rho,) – set by solve()
         self.in_elm_region: torch.Tensor | None = None
         self.alpha_MHD: torch.Tensor | None = None
@@ -441,7 +441,7 @@ class EpedElm(ElmStability):
                 ["julia", "-e", julia_cmd],
                 capture_output=True,
                 text=True,
-                timeout=30,
+                timeout=60,
             )
             if result.returncode != 0:
                 return False, f"Julia failed to load EPEDNN: {result.stderr}"

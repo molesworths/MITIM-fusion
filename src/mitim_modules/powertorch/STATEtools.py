@@ -691,6 +691,48 @@ class powerstate:
                                     self.plasma["ti"], self.plasma["ni"] * 1e-1, self.plasma["aLti"], aLni,
                                     self.plasma["a"].unsqueeze(-1), self.plasma["B_unit"], self.plasma["q"], self.plasma["roa"]*self.plasma["a"].unsqueeze(-1))
 
+        # ------------------------------------------------------------------------------------------
+        # Nonstationary-GP drivers (ITG turn-on + ExB suppression) for the flux surrogates that must
+        # span an L->H transition. Computed here (full radial profile available) and consumed per
+        # radius as GP input features by the ExB-suppression surrogate. See exb_nonstationary.py.
+        #   * gamma_ExB_dia : ion-diamagnetic ExB shearing rate |d/dr( (rho_i v_th,i / p_i) dp_i/dr )|
+        #                     (= |dV_dia/dr|, V_dia the diamagnetic ExB drift), normalised to c_s/a.
+        #   * gamma_lin_itg : ITG linear growth ~ |omega_r| sqrt(<R/LTi - R/LTi_crit>_+), Guo-Romanelli
+        #                     critical gradient, k_y rho_i = 0.3, also in c_s/a.
+        #   * mu_exb        : structured log gyroBohm-flux driver ln( gamma_eff^2 + floor ) with
+        #                     gamma_eff = <gamma_lin_itg - a_E gamma_ExB_dia>_+ (the affine GP mean's
+        #                     load-bearing feature; corner constants below, learnable weight in the mean).
+        # ------------------------------------------------------------------------------------------
+        _KY_RHO_I, _A_E, _D_CRIT, _FLUX_FLOOR = 0.30, 1.0, 0.0, 1.0e-3
+        rmin = self.plasma["rmin"]
+        rmin1d = rmin[0] if rmin.dim() > 1 else rmin
+        tite = self.plasma["tite"]
+        rho_s_p = self.plasma["rho_s"]; c_s_p = self.plasma["c_s"]; a_p = self.plasma["a"].unsqueeze(-1)
+        aspect = self.plasma["Rmajoa"] if "Rmajoa" in self.plasma \
+            else torch.clamp(self.plasma["roa"] / torch.clamp(self.plasma["eps"], min=1e-6), min=1.0)
+        aspect = torch.clamp(aspect, min=1.0)
+
+        # Ion-diamagnetic ExB shear (only d ln p_i / dr enters the drift, so p_i units cancel).
+        p_i = self.plasma["ti"] * self.plasma["ni"].sum(-1)
+        dlnp_i = torch.gradient(p_i, spacing=(rmin1d,), dim=-1)[0] / torch.clamp(p_i, min=1e-30)
+        V_dia = rho_s_p * c_s_p * tite * dlnp_i                     # rho_i v_th,i = rho_s c_s tite  [m/s]
+        self.plasma["gamma_ExB_dia"] = torch.abs(
+            torch.gradient(V_dia, spacing=(rmin1d,), dim=-1)[0]) * a_p / torch.clamp(c_s_p, min=1e-30)
+
+        # ITG linear growth with Guo-Romanelli critical gradient (R/L units for the threshold).
+        q_abs = torch.clamp(torch.abs(self.plasma["q"]), min=0.5)
+        aLti_R = aspect * self.plasma["aLti"]
+        aLne_R = aspect * torch.clamp(self.plasma["aLne"], min=0.0)
+        aLTi_crit_R = torch.maximum(
+            (1.0 + (4.0 / 3.0) * tite) * (1.0 + 2.0 * torch.clamp(self.plasma["shear"], min=0.0) / q_abs),
+            1.2 * aLne_R) + _D_CRIT
+        omega_r_pref = (_KY_RHO_I / torch.sqrt(torch.clamp(tite, min=1e-3))) / aspect  # |omega_r| a/c_s
+        self.plasma["gamma_lin_itg"] = omega_r_pref * torch.sqrt(
+            torch.clamp(aLti_R - aLTi_crit_R, min=0.0) + 1e-12)
+
+        gamma_eff = torch.clamp(self.plasma["gamma_lin_itg"] - _A_E * self.plasma["gamma_ExB_dia"], min=0.0)
+        self.plasma["mu_exb"] = torch.log(gamma_eff ** 2 + _FLUX_FLOOR)
+
         """
 		Rotation stuff
 		--------------

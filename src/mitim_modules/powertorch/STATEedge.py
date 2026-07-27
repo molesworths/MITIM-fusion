@@ -103,6 +103,12 @@ class powerstate_edge(powerstate):
         # {"K_neo": "sauter"} to add the neoclassical poloidal-flow term to Er.
         # vgen / imposed-toroidal-rotation (vtor) backends live there too.
         ("rotation_options",            {}),
+        # Nonlocal transport corrections (ExB quench + turbulence spreading);
+        # see mitim_tools.edge_tools.nonlocality. "Analytic" activates; "Null"
+        # (default) skips. Options: {"ExB": bool, "Spreading": bool,
+        # "lambda_c_mult": C, "kernel": "gauss", "alpha_e", "p", ...}.
+        ("nonlocal_model",              "Null"),
+        ("nonlocal_model_options",      {}),
     ]
 
     @staticmethod
@@ -178,6 +184,14 @@ class powerstate_edge(powerstate):
         self.transport_options = transport_options
         self.target_options = target_options
         self.targets_resolution = target_options["options"].get("targets_resolution", None)
+
+        # Nonlocal model active -> force the shear-free transport-code settings
+        # (VEXB_SHEAR=0 / ALPHA_QUENCH=0 for TGLF, ROTATION_FLAG=0 for QLGYRO)
+        # so the external per-ky quench in edge_tools.nonlocality owns ALL ExB
+        # physics. Done once here, at run configuration time.
+        if self._nonlocal_options is not None:
+            from mitim_tools.edge_tools import nonlocality
+            nonlocality.inject_run_settings(self.transport_options, self._nonlocal_options)
 
         # Default options
         self.predicted_channels = evolution_options.get("ProfilePredicted", ["te", "ti", "ne"])
@@ -366,6 +380,13 @@ class powerstate_edge(powerstate):
         # Rotation model options (analytic / vgen backends, imposed vtor); see
         # mitim_tools.edge_tools.rotation.
         self._rotation_options     = dict(opts.get("rotation_options", {}) or {})
+
+        # Nonlocal transport corrections (ExB quench + turbulence spreading); see
+        # mitim_tools.edge_tools.nonlocality. Parsed here; the shear-free run
+        # settings (VEXB_SHEAR=0 / ALPHA_QUENCH=0 / ROTATION_FLAG=0) are injected
+        # into transport_options at __init__ (the module owns ALL ExB physics).
+        from mitim_tools.edge_tools import nonlocality as _nonlocality_mod
+        self._nonlocal_options     = _nonlocality_mod.parse_options(opts)
 
     def _bind_parameterizer(self, parameterizer_name, parameterizer_options):
         """Instantiate and bind the configured parameterizer model."""
@@ -940,6 +961,32 @@ class powerstate_edge(powerstate):
             p["B_p"] = Bp
             p["B_T"] = float(np.asarray(self.profiles.profiles["bcentr(T)"]).reshape(-1)[0]) * R / R0  # Toroidal field from total field and geometry
 
+        # Nonlocal ExB feature availability on the SURROGATE transform path:
+        # constructEvaluationProfiles (PORTALStools) only calls
+        # calculateProfileFunctions, never calculateRotation, but the GP input
+        # transform needs plasma["gamma_exb_nl"] recomputed per candidate X.
+        # Rotation is stateless and cheap on the analytic backend, so run it
+        # here when the nonlocal ExB model is active. calculate() step 3b will
+        # recompute identically (idempotent). The vgen backend is excluded --
+        # an external NEO solve per transform call is a non-starter; the
+        # analytic closure is used for the feature in that case (declared).
+        # Also forced when a rotation-derived quantity (e.g. vexb_shear) is requested as a GP
+        # feature (global_surrogates_options.extra_features) -- otherwise plasma[key] is missing
+        # on this path. Flag set in PORTALSedge; same analytic-for-vgen guard as the nonlocal case.
+        nl = getattr(self, "_nonlocal_options", None)
+        _need_rotation = (nl and nl.get("ExB", True)) or getattr(self, "_force_rotation_on_transform", False)
+        if _need_rotation:
+            _rot_mode = (getattr(self, "_rotation_options", {}) or {}).get("mode", "analytic")
+            if _rot_mode == "vgen":
+                _saved = dict(self._rotation_options)
+                self._rotation_options["mode"] = "analytic"
+                try:
+                    self.calculateRotation()
+                finally:
+                    self._rotation_options = _saved
+            else:
+                self.calculateRotation()
+
     def calculateRotation(self):
         """
         Compute the self-consistent E×B rotation inputs (w0, E_rad, vexb,
@@ -966,6 +1013,12 @@ class powerstate_edge(powerstate):
                             toroidal (mass) rotation entering Er as Vtor*Bp.
             vtor_pairs    : [(rho, vtor_m_s), ...] for vtor_source="user" (a single
                             pair = spatially constant V_tor).
+            vtor_extract_smooth : odd window (plasma-grid points, default 5) to
+                            smooth the backed-out Vtor at the pedestal foot for
+                            vtor_source="extract_initial". Width = window*drho; the
+                            edge grid is drho~0.005 so window~5-7 removes the foot
+                            wiggle while preserving pedestal-top vexb_shear (>~9
+                            starts eroding it). Set <= 1 to disable.
             vgen_every    : re-solve NEO every N calls in "vgen" mode (default 1).
             vgen_drho     : radial spacing of the cropped vgen input.gacode
                             (default 0.01); coarser = fewer NEO surfaces = faster.
@@ -994,11 +1047,34 @@ class powerstate_edge(powerstate):
         # on the w0_override path.
         w0_override = self._rotation_w0_vgen(vtor) if opts.get("mode") == "vgen" else None
 
-        out = rotation.calculate_rotation(**inputs, vtor=vtor, w0_override=w0_override)
+        nl = getattr(self, "_nonlocal_options", None)
+        want_fine = bool(nl and nl.get("ExB", True))
+
+        # The nonlocal kernel integral needs the Er-well structure resolved
+        # (lambda_c ~ grid spacing): raise the refinement floor to 4x unless the
+        # user pinned oversample explicitly in rotation_options.
+        if want_fine and "oversample" not in opts:
+            inputs["oversample"] = max(int(inputs.get("oversample", 2)), 4)
+
+        out = rotation.calculate_rotation(**inputs, vtor=vtor, w0_override=w0_override,
+                                          return_fine=want_fine)
 
         for key in ("w0", "Er", "E_rad", "vexb", "gamma_exb", "vexb_shear",
                     "gamma_p", "mach", "w0_n", "aLw0_n", "tau_norm"):
             p[key] = out[key]
+
+        # Nonlocal ExB: rms-smeared |gamma_E,eff| in a/c_s units, computed on the
+        # oversampled rotation grid (the well structure must be resolved BEFORE
+        # squaring/averaging) and stored as a plasma key. Dual-use by design:
+        #  (a) physical input to the external per-ky quench (calculateNonlocal);
+        #  (b) deterministic per-surface GP feature ("gamma_exb_nl") -- fully
+        #      analytic in the profiles since lambda_c = C rho_s carries no
+        #      spectra dependence, so feature == input, no proxy mismatch.
+        if want_fine:
+            from mitim_tools.edge_tools import nonlocality
+            self._rotation_fine = out.pop("_fine")
+            p["gamma_exb_nl"] = nonlocality.compute_gamma_exb_nl(
+                self, self._rotation_fine, nl)
 
     def _rotation_inputs(self):
         """Assemble the kwargs consumed by ``rotation.calculate_rotation`` from the
@@ -1579,8 +1655,17 @@ class powerstate_edge(powerstate):
         self.plasma["P"]    = torch.Tensor().to(self.plasma["QeMWm2"])
         self.plasma["P_tr"] = torch.Tensor().to(self.plasma["QeMWm2"])
 
+        # Nonlocal spreading active -> the solver residual must see the
+        # nonlocal-adjusted totals ("<flux>_nl"), while "<flux>" stays the
+        # (quenched) local version that feeds the OFs / flux GPs. The GP path
+        # applies the same spread operator in portals_edge.scalarized_objective.
+        _nl_on = bool(getattr(self, "_nonlocal_options", None)
+                      and self._nonlocal_options.get("Spreading", True))
+
         for profile in self.predicted_channels:
             profile_key, flux_key = self.profile_map[profile]
+            if _nl_on and f"{flux_key}_nl" in self.plasma:
+                flux_key = f"{flux_key}_nl"
             profile_cp = self._interp_tensor_from_rho_to_rhoCP(self.plasma[profile_key])
             flux_cp = self._interp_tensor_from_rho_to_rhoCP(self.plasma[flux_key])
             self.plasma["P"] = torch.cat(
@@ -1845,6 +1930,19 @@ class powerstate_edge(powerstate):
             folder=folder,
             evaluation_number=evaluation_number,
         )
+
+        # 5b. Nonlocal corrections: external per-ky ExB quench (from the
+        #     shear-free run's own spectra) then tier-A turbulence spreading.
+        #     Order matters (shear suppresses the source, spreading
+        #     redistributes what survives) and this must precede the ELM
+        #     penalty, which acts on final physical fluxes.
+        #     Quenched values overwrite "_tr_turb" (GP-facing, learnable via
+        #     the gamma_exb_nl feature); spread totals land in "_tr_nl" keys
+        #     consumed by calculateMetrics (solver-facing).
+        if getattr(self, "_nonlocal_options", None) is not None:
+            from mitim_tools.edge_tools import nonlocality
+            nonlocality.calculateNonlocal(self, IOtools.expandPath(folder),
+                                          self._nonlocal_options)
 
         # 6. ELM peeling-ballooning penalty → inflates turbulent fluxes if unstable
         self.calculateElm() # EPED-NN?

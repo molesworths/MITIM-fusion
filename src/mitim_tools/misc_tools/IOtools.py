@@ -399,6 +399,43 @@ def get_git_info(repo_path):
 
     return branch, commit_hash
 
+
+def code_version_manifest(extra_repos=None):
+    """Reproducibility manifest for a run: commit + branch + local-modification state of
+    the codes that produced it. Because working trees here are often locally modified and
+    not pushed, a bare commit hash is insufficient -- so we also record the number of
+    uncommitted files and a short sha1 of ``git diff HEAD``, which uniquely identifies the
+    exact local state (a clean, pushed commit is the only fully reproducible case).
+
+    Covers MITIM-fusion and (via $GACODE_ROOT) gacode by default; pass ``extra_repos`` as a
+    {name: path} dict to add more. Returns a JSON-serializable dict."""
+    import os, subprocess, hashlib
+    from mitim_tools import __mitimroot__
+    repos = {"MITIM-fusion": str(__mitimroot__)}
+    gr = os.environ.get("GACODE_ROOT")
+    if gr:
+        repos["gacode"] = gr
+    if extra_repos:
+        repos.update({k: str(v) for k, v in extra_repos.items()})
+    manifest = {}
+    for name, path in repos.items():
+        try:
+            branch, commit = get_git_info(path)
+            st = subprocess.run(['git', '-C', path, 'status', '--porcelain'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            n_unc = len([l for l in st.stdout.splitlines() if l.strip()]) if st.returncode == 0 else None
+            df = subprocess.run(['git', '-C', path, 'diff', 'HEAD'],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            diff_sha = (hashlib.sha1(df.stdout.encode()).hexdigest()[:10]
+                        if (df.returncode == 0 and df.stdout) else None)
+            manifest[name] = {"path": path, "branch": branch, "commit": commit,
+                              "n_uncommitted": n_unc, "diff_sha1": diff_sha,
+                              "clean": (n_unc == 0)}
+        except Exception as e:
+            manifest[name] = {"path": path, "error": repr(e)[:120]}
+    return manifest
+
+
 def createCDF_simple(file, zvals, names):
     """
     This creates a simple netCDF of 1D variables of the same size

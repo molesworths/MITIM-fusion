@@ -36,9 +36,14 @@ Add an ``edge_options`` block alongside the standard ``solution`` block:
       use_edge_targets : true
 
       # Global surrogates: fit one GP per turbulent channel spanning the rho domain instead
-      # of one GP per rhoCP. Adds magnetic shear as a radial-location feature and pools the
-      # samples from all rhoCP (converted to gyro-Bohm space) into each turbulent GP.
+      # of one GP per rhoCP. Appends radial-location/physics feature(s) and pools the samples
+      # from all rhoCP (converted to gyro-Bohm space) into each turbulent GP.
       global_surrogates : false
+      # Which feature(s) to append as radial labels (any per-radius powerstate.plasma key).
+      # Defaults to ["shear"]. E.g. "vexb_shear" to test the mean-flow ExB shear as a
+      # suppression feature (rotation run needed), or ["shear","vexb_shear"] for both.
+      global_surrogates_options :
+        extra_features : ["shear"]
 """
 
 import copy
@@ -345,6 +350,15 @@ def initializeProblem(
     portals_fun.powerstate.calculateProfileFunctions()
     portals_fun.powerstate.calculateTargets()
 
+    # Nonlocal spreading: freeze the tier-A spread operator NOW, on the TEMPLATE
+    # powerstate (base-profile rho_s), so every per-evaluation deep copy AND the
+    # GP path in scalarized_objective use the identical matrix. Building it
+    # lazily inside an evaluation would store it on the copy only.
+    _nl = getattr(portals_fun.powerstate, "_nonlocal_options", None)
+    if _nl and _nl.get("Spreading", True):
+        from mitim_tools.edge_tools.nonlocality import spreading as _nl_spreading
+        _nl_spreading.get_spread_matrix(portals_fun.powerstate, _nl)
+
     thr = 1E-5
 
     parameterizer_name = portals_fun.portals_parameters["solution"].get("parameterizer", "spline")
@@ -519,8 +533,42 @@ def initializeProblem(
     }
 
     # Global surrogates: tell the fitter to pool samples across rhoCP for the turbulent channels
-    global_surrogates = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("global_surrogates", False))
+    edge_options = portals_fun.portals_parameters.get("edge_options", {}) or {}
+    global_surrogates = bool(edge_options.get("global_surrogates", False))
     portals_fun.optimization_options["surrogate_options"]["global_surrogates"] = global_surrogates
+
+    # If a rotation-derived feature (vexb_shear, gamma_exb, w0_n, ...) is used as a global-surrogate
+    # radial label, the edge state must compute rotation on the GP transform path (it is skipped by
+    # default there); flag the powerstate so calculateProfileFunctions runs calculateRotation.
+    if global_surrogates and (set(_global_surrogate_extra_features(edge_options)) & _ROTATION_DERIVED_KEYS):
+        portals_fun.powerstate._force_rotation_on_transform = True
+
+    # Nonstationary ExB-suppression surrogate: one heat-flux GP that spans an L->H transition
+    # (ITG turn-on + ExB-shear suppression, modelled in ln(GB flux) space). Drop-in for the
+    # standard flux GP on the Qe/Qi turbulent channels; see exb_nonstationary.
+    nonstationary_exb = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("nonstationary_exb", False))
+    portals_fun.optimization_options["surrogate_options"]["nonstationary_exb"] = nonstationary_exb
+
+# Rotation-derived plasma keys (computed by STATEedge.calculateRotation, NOT by the default edge
+# calculateProfileFunctions). Requesting any of these as a GP feature forces rotation on the
+# transform path (see _force_rotation_on_transform).
+_ROTATION_DERIVED_KEYS = {
+    "w0", "E_rad", "Er", "vexb", "gamma_exb", "vexb_shear", "mach", "gamma_p", "w0_n", "aLw0_n",
+}
+
+
+def _global_surrogate_extra_features(edge_options):
+    """Radial-location / physics features appended to the turbulent channels under global_surrogates.
+
+    Read from edge_options["global_surrogates_options"]["extra_features"] (str or list of
+    powerstate.plasma keys); defaults to ["shear"] for backward compatibility.
+    """
+    opts = (edge_options or {}).get("global_surrogates_options", {}) or {}
+    extra = opts.get("extra_features", ["shear"])
+    if isinstance(extra, str):
+        extra = [extra]
+    return list(extra)
+
 
 def prepportals_transformation_variables(portals_fun, ikey, doNotFitOnFixedValues=False):
     allOuts = portals_fun.optimization_options["problem_options"]["ofs"]
@@ -630,16 +678,62 @@ def prepportals_transformation_variables(portals_fun, ikey, doNotFitOnFixedValue
             Variables[output] = ["MtGB"]
 
     # ------------------------------------------------------------------------------------------
-    # Global surrogates: append magnetic shear as a radial-location feature to the turbulent
-    # channels so that a single GP can span the rho domain (samples at different rhoCP are
-    # distinguished by their shear value). Background quantity -> always included when enabled.
+    # Global surrogates: append radial-location / physics features to the turbulent channels so a
+    # single GP can span the rho domain (samples at different rhoCP are distinguished by these
+    # feature values). Which features are appended is configurable via
+    #   edge_options["global_surrogates_options"]["extra_features"]  (str or list of plasma keys)
+    # defaulting to ["shear"] (magnetic shear, the original radial label). Each name must be a
+    # per-radius powerstate.plasma key (e.g. "shear", "vexb_shear", "nuei", ...). Use e.g.
+    # {"extra_features": "vexb_shear"} to test the mean-flow ExB shear as a suppression feature,
+    # or ["shear", "vexb_shear"] for both. NB vexb_shear needs a rotation run (0 otherwise).
     # ------------------------------------------------------------------------------------------
-    global_surrogates = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("global_surrogates", False))
-    if global_surrogates:
+    edge_options = portals_fun.portals_parameters.get("edge_options", {}) or {}
+    if bool(edge_options.get("global_surrogates", False)):
+        extra_features = _global_surrogate_extra_features(edge_options)
         for output in list(Variables.keys()):
             typ = "_".join(output.split("_")[:-1])
-            if typ.endswith("_tr_turb") and ("shear" not in Variables[output]):
-                Variables[output].append("shear")
+            if typ.endswith("_tr_turb"):
+                for feat in extra_features:
+                    if feat not in Variables[output]:
+                        Variables[output].append(feat)
+
+    # ------------------------------------------------------------------------------------------
+    # Nonstationary ExB-suppression surrogate: append the precomputed physical driver features
+    # (ITG growth, diamagnetic ExB shear, structured log-flux mu_exb) to the heat-flux channels
+    # so the affine physics-driver mean and the Matern residual can consume them per radius.
+    # ------------------------------------------------------------------------------------------
+    from mitim_tools.edge_tools import exb_nonstationary
+    nonstationary_exb = bool((portals_fun.portals_parameters.get("edge_options", {}) or {}).get("nonstationary_exb", False))
+    if nonstationary_exb:
+        for output in list(Variables.keys()):
+            if exb_nonstationary.is_exb_channel(output):
+                for feat in exb_nonstationary.EXB_FEATURES:
+                    if feat not in Variables[output]:
+                        Variables[output].append(feat)
+
+    # ------------------------------------------------------------------------------------------
+    # Nonlocal ExB quench: OPTIONALLY append the rms-smeared shear |gamma_E,eff| (a/c_s) as a
+    # per-surface feature to the turbulent channels. The stored turbulent OFs are QUENCHED local
+    # fluxes, and gamma_exb_nl is exactly the quench input (analytic, lambda_c = C rho_s, no
+    # spectra dependence), so feature == physical input: the GP could learn the suppression it
+    # sees. But it is NOT added by default -- gamma_exb_nl is highly collinear with the driving
+    # gradients (steeper p_i -> deeper Er well -> larger shear), so it can burn a feature
+    # dimension on scarce data without adding information. Opt in with
+    # nonlocal_model_options["gamma_exb_nl_feature"]=True.
+    # (The quench itself does NOT depend on this: it reads plasma["gamma_exb_nl"] as a physical
+    # input in calculateNonlocal regardless. This flag only controls the GP INPUT space.)
+    # Spreading is deliberately NEVER a feature -- it depends on the flux field the GP predicts,
+    # and is applied as a linear operator on GP outputs in scalarized_objective instead.
+    # ------------------------------------------------------------------------------------------
+    _eo = portals_fun.portals_parameters.get("edge_options", {}) or {}
+    _nl_name = str(_eo.get("nonlocal_model", "Null") or "Null")
+    _nlo = _eo.get("nonlocal_model_options", {}) or {}
+    if (_nl_name.lower() == "analytic" and _nlo.get("ExB", True)
+            and _nlo.get("gamma_exb_nl_feature", False)):
+        for output in list(Variables.keys()):
+            typ = "_".join(output.split("_")[:-1])
+            if typ.endswith("_tr_turb") and ("gamma_exb_nl" not in Variables[output]):
+                Variables[output].append("gamma_exb_nl")
 
     return Variables
 
@@ -696,14 +790,27 @@ def runModelEvaluator_edge(
                                   ["initialization_options"]["initial_training"])
             except Exception:
                 start_after = 0
-        if numPORTALS < start_after:
+        # numPORTALS arrives as a str (parsed from the eval filename); coerce
+        # before the numeric gate.  Fall back to 0 if it is somehow non-numeric.
+        try:
+            num_eval = int(numPORTALS)
+        except (TypeError, ValueError):
+            num_eval = 0
+        if num_eval < start_after:
             print(f"[PORTALSedge] edge-UQ skipped at eval {numPORTALS} "
                   f"(training phase, < {start_after})", typeMsg="i")
         else:
             try:
                 from mitim_tools.edge_tools.uq.run import run_edge_uq
+                # Real-model UQ transport re-runs get a UNIQUE base folder under
+                # this evaluation's (already-unique) transport folder, so their
+                # remote scratch paths never collide with the main eval, other UQ
+                # columns, or concurrent discharge optimizations.  Overridable via
+                # _edge_uq_options["folder"].
+                uq_folder = uq_opts.pop("folder", folder_model / "edge_uq")
                 self._edge_uq_last = run_edge_uq(
-                    powerstate, uq_inputs, X_dvs=X, inject_into=powerstate, **uq_opts
+                    powerstate, uq_inputs, X_dvs=X, inject_into=powerstate,
+                    folder=uq_folder, **uq_opts
                 )
                 if not hasattr(self, "_edge_uq_history"):
                     self._edge_uq_history = []
@@ -943,6 +1050,23 @@ class portals_edge(portals):
                 var_dict[var] = torch.Tensor().to(Y)
             var_dict[var] = torch.cat((var_dict[var], Y[..., ofs_ordered_names == of]), dim=-1)
 
+        # -------------------------------------------------------------------------
+        # Nonlocal turbulence spreading on the GP path: apply the SAME frozen
+        # tier-A operator that calculateNonlocal applies to real evaluations, to
+        # the surrogate-predicted TURBULENT fluxes (physical units here). The GPs
+        # are trained on the quenched-local fluxes, so spreading must be applied
+        # downstream of them -- exactly as it is downstream of TGLF/QLGYRO.
+        # -------------------------------------------------------------------------
+        _nl = getattr(self.powerstate, "_nonlocal_options", None)
+        _M = getattr(self.powerstate, "_nonlocal_spread_M", None)
+        if _nl and _nl.get("Spreading", True) and (_M is not None):
+            _M = _M.to(Y)
+            for var in list(var_dict.keys()):
+                if var.endswith("_tr_turb") and not var.startswith("Qie"):
+                    v = var_dict[var]
+                    if v.shape[-1] == _M.shape[-1]:
+                        var_dict[var] = torch.einsum("ij,...j->...i", _M, v)
+
         """
 		-------------------------------------------------------------------------
 		Calculate quantities
@@ -1021,6 +1145,20 @@ def calculate_residuals(powerstate, portals_parameters, specific_vars=None):
                 var_dict[ikey + "_stds"] = powerstate.plasma[mapper[ikey] + "_stds"][..., 1:]
             else:
                 var_dict[ikey + "_stds"] = None
+
+        # Nonlocal spreading: the plasma "_tr_turb" keys are the QUENCHED LOCAL
+        # fluxes (GP-facing); the solver residual (calculateMetrics) uses the
+        # spread "_nl" totals. Apply the same frozen tier-A operator here so this
+        # analysis path reports the residuals the solver actually minimized.
+        _nl = getattr(powerstate, "_nonlocal_options", None)
+        _M = getattr(powerstate, "_nonlocal_spread_M", None)
+        if _nl and _nl.get("Spreading", True) and (_M is not None):
+            for ikey in list(var_dict.keys()):
+                if ikey.endswith("_tr_turb") and not ikey.startswith("Qie"):
+                    v = var_dict[ikey]
+                    if (v is not None) and v.shape[-1] == _M.shape[-1]:
+                        var_dict[ikey] = torch.einsum(
+                            "ij,...j->...i", _M.to(v), v)
 
     dfT = list(var_dict.values())[0]  # as a reference for sizes
 

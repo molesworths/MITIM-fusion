@@ -25,6 +25,7 @@ powerstate passed in ``inject_into`` (if given).
 
 from typing import Optional
 
+import numpy as np
 import torch
 
 from mitim_tools.misc_tools.LOGtools import printMsg as print
@@ -119,33 +120,80 @@ def induced_aly_sigma(powerstate, channels, sigma_y):
             for ch in channels if ch in base}
 
 
-def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti):
+def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti, batch=0):
     """
     Correlated aLy perturbation directions from PeretSSF, for use with a Fixed
-    NOMINAL aLy: the aLy response to a +1-sigma Te and Ti perturbation, computed
-    through a PeretSSF bc_model.  Returns [(source, {ch: delta_aLy})] -- a rank-2
-    factor of the PeretSSF aLy covariance (correlations across aLne/aLte/aLti
-    preserved because one Te/Ti perturbation moves them together).
-    """
-    from mitim_tools.edge_tools.boundary import build_bc_model
-    opts = dict(getattr(powerstate, "_bc_model_options", {}) or {})
+    NOMINAL aLy: the aLy response to a +1-sigma Te and Ti perturbation.  Returns
+    [(source, {ch: delta_aLy})] -- a rank-2 factor of the PeretSSF aLy covariance
+    (correlations across aLne/aLte/aLti preserved because one Te/Ti perturbation
+    moves them together).
 
-    def aly(o):
-        m = build_bc_model({"y": "Fixed", "aLy": "PeretSSF"}, o)
-        m.get_boundary_conditions(powerstate, batch_idx=0)
-        return {ch: float(m.bc_dict[f"aL{ch}"][0]) for ch in channels
-                if f"aL{ch}" in m.bc_dict}
-    base = aly(opts)
-    dirs = []
-    for src, sig in (("te", sigma_te), ("ti", sigma_ti)):
-        if src not in opts or not sig:
+    The Te/Ti perturbation is sourced from the REAL LCFS state
+    (``powerstate.plasma``) via the differentiable PeretSSF model
+    ``peret_torch.ssf_decay_lengths_torch``, so the delta is the exact
+    implicit-function sensitivity ``(d aLy/d T) * T * sigma_T`` -- NOT a finite
+    difference on ``bc_model_options``.  This makes the aLy-BC uncertainty follow
+    the LCFS (Te,Ti) uncertainty even when the nominal ``bc_model`` is
+    ``{aLy: Fixed}`` and ``bc_model_options`` is empty (the previous FD path
+    silently returned zero directions in that case).
+    """
+    if not (sigma_te or sigma_ti):
+        return []
+
+    from mitim_tools.edge_tools.boundary import _LCFSState, aLy_PeretSSF
+    from mitim_tools.edge_tools.uq.peret_torch import (
+        ssf_decay_lengths_torch, state_scalars_from_lcfs)
+
+    opts = dict(getattr(powerstate, "_bc_model_options", {}) or {})
+    peret_opts = dict(opts.get("aLy") if isinstance(opts.get("aLy"), dict) else opts)
+
+    from mitim_tools.misc_tools.PLASMAtools import md_u as _MD_U
+    state = _LCFSState.extract(
+        powerstate, b=batch,
+        Zeff_override=peret_opts.get("Zeff"),
+        mi_ref_u=float(peret_opts.get("mi_ref_u", _MD_U)),
+        Lpar_override=peret_opts.get("Lpar"),
+    )
+
+    # Resolve G0 / alpha_s / Lambda / f_Delta exactly as aLy_PeretSSF.solve does
+    # (keeps the perturbation model in sync with the nominal SSF physics).
+    model = aLy_PeretSSF(peret_opts)
+    eq = model._load_equilibrium()
+    if eq is not None:
+        G0, alpha_s = float(eq.G0), float(eq.alpha_s)
+    else:
+        G0 = model.G0
+        alpha_s = -model.shear_ref / max(abs(state.shear), 0.1)
+    Lambda = (0.5 * np.log(1.0 / (2.0 * np.pi * state.me_over_mi))
+              if model.Lambda is None else float(model.Lambda))
+    f_Delta = model.f_Delta
+
+    scal = state_scalars_from_lcfs(state)  # rho_s_ref, te_ref, R0, Lpar, a, me_over_mi
+    te_leaf = torch.tensor(state.te, dtype=torch.double, requires_grad=True)  # eV
+    ti_leaf = torch.tensor(state.ti, dtype=torch.double, requires_grad=True)  # eV
+    out = ssf_decay_lengths_torch(
+        te=te_leaf, ti=ti_leaf, G0=G0, alpha_s=alpha_s,
+        Lambda=Lambda, f_Delta=f_Delta, **scal,
+    )
+
+    aly_map = {"te": "aLte", "ti": "aLti", "ne": "aLne", "ni": "aLni"}
+    delta_te, delta_ti = {}, {}
+    for ch in channels:
+        key = aly_map.get(ch)
+        if key is None or key not in out:
             continue
-        o = dict(opts); o[src] = o[src] * (1.0 + sig)
-        pert = aly(o)
-        delta = {ch: pert.get(ch, base.get(ch, 0.0)) - base.get(ch, 0.0)
-                 for ch in base}
-        if any(abs(v) > 1e-9 for v in delta.values()):
-            dirs.append((src, delta))
+        g_te, g_ti = torch.autograd.grad(
+            out[key], [te_leaf, ti_leaf], retain_graph=True, allow_unused=True)
+        if sigma_te and g_te is not None:
+            delta_te[ch] = float(g_te) * state.te * float(sigma_te)
+        if sigma_ti and g_ti is not None:
+            delta_ti[ch] = float(g_ti) * state.ti * float(sigma_ti)
+
+    dirs = []
+    if any(abs(v) > 1e-9 for v in delta_te.values()):
+        dirs.append(("te", delta_te))
+    if any(abs(v) > 1e-9 for v in delta_ti.values()):
+        dirs.append(("ti", delta_ti))
     return dirs
 
 
@@ -156,6 +204,9 @@ def augment_with_peret_aly(x0, L, layout, powerstate, channels,
     dirs = peret_aly_directions(powerstate, channels, sigma_te, sigma_ti)
     if not dirs:
         return x0, L, layout, 0
+    # Nominal aLy BC per channel so the scatter can seed _bc_model_options even
+    # when it is empty (Fixed nominal); the driver adds amp*delta on top of this.
+    nominal = _read_aly_bc(powerstate, channels)
     dtype = x0.dtype
     base = x0.numel()
     n_new = len(dirs)
@@ -171,7 +222,7 @@ def augment_with_peret_aly(x0, L, layout, powerstate, channels,
             "corr_factor": None,
             "scatter": ScatterSpec(kind="aly_cov", key=f"peret_aly_{src}",
                                    slots=[slot], space="absolute",
-                                   meta={"delta": delta}),
+                                   meta={"delta": delta, "nominal": dict(nominal)}),
         }
     print(f"[UQ] PeretSSF-projected aLy: added {n_new} correlated aLy columns "
           f"(Fixed nominal) -> {[d[0] for d in dirs]}", typeMsg="i")
@@ -192,7 +243,13 @@ def _build_sigma_prior(uq_inputs, powerstate, lcfs_aly_mode):
             sigma_prior.setdefault(nm[2:], {})["aLy"] = rs
 
     is_peret = "peret" in _aly_model_name(powerstate).lower()
-    if lcfs_aly_mode == "fixed" or (lcfs_aly_mode == "auto" and not is_peret):
+    # "fixed": use ONLY the explicit add_bc_option aLy priors (no Peret coupling).
+    # "auto"/"peret": induce the aLy-BC uncertainty from the LCFS Te/Ti through the
+    # PeretSSF model even when the NOMINAL aLy is Fixed -- this is the physical aLy
+    # decay-length uncertainty and is what the SplineMtanh fit should be sampled
+    # over.  (Previously "auto" bailed for a non-Peret nominal, leaving aLy with no
+    # uncertainty -- e.g. aLte collapsing to ~0.)
+    if lcfs_aly_mode == "fixed":
         return sigma_prior
 
     # PeretSSF mode: aLy uncertainty is INDUCED from Te/Ti through the bc_model on
@@ -258,6 +315,7 @@ def run_edge_uq(
     profile_std_suffix: str = "_uq_std",
     alpha_conv: float = 0.05,
     n_samples: int = 20000,
+    folder=None,
 ):
     """
     Full in-loop UQ pass.
@@ -294,6 +352,13 @@ def run_edge_uq(
         features->flux with ~0 noise and stays informative; the input uncertainty
         is consumed at the objective level (sigma_J / robust_objective / Sigma_r),
         i.e. propagated THROUGH the trained map, not injected as training noise.
+    folder : base folder for the real-model transport RE-RUNS (mode="real_scan").
+        Each scanned column runs in a unique "uq_<col>" subfolder so the remote
+        scratch name (a deterministic hash of the local run path) is unique per
+        eval -- preventing the tarball collisions ("Not all received") that occur
+        when every re-run defaults to calculate(folder="~/scratch/") and shares one
+        constant remote folder across columns and concurrent optimizations.  None
+        keeps the legacy default (safe only with a transport_proxy / no remote runs).
 
     Returns
     -------
@@ -333,7 +398,7 @@ def run_edge_uq(
     # PeretSSF aLy directions explicitly.  (If nominal aLy is already PeretSSF, the
     # add_lcfs Te/Ti columns carry it automatically; don't double-inject.)
     is_peret_nominal = "peret" in _aly_model_name(powerstate).lower()
-    if lcfs_aly_mode == "peret" and not is_peret_nominal:
+    if lcfs_aly_mode in ("peret", "auto") and not is_peret_nominal:
         s_te = sigma_prior.get("te", {}).get("y", 0.0)
         s_ti = sigma_prior.get("ti", {}).get("y", 0.0)
         if s_te or s_ti:
@@ -343,7 +408,8 @@ def run_edge_uq(
 
     # 2. propagate target + transport (stacked) -> residual factor
     st = UQState(powerstate, X_dvs=X_dvs, layout=layout, batch=batch, stacked=True,
-                 rotation_proxy=rotation_proxy, transport_proxy=transport_proxy)
+                 rotation_proxy=rotation_proxy, transport_proxy=transport_proxy,
+                 folder=folder)
     st.outlier_factor = outlier_factor
     profile_std = None
     # The OF flux keys (Ge/GZ/Qe.../Mt...) are ALWAYS scanned so their native-unit
@@ -357,6 +423,34 @@ def run_edge_uq(
         # (use_scan_trick_for_stds analogue on the inputs).  Baseline reused from
         # the eval that just ran -> only n_inputs extra real evals.
         baseline = st.stacked_baseline_from_plasma(powerstate)
+        # STALE-BASELINE GUARD.  The reuse above is valid only if powerstate.plasma
+        # really is the evaluation of (X_dvs, x0).  With CALM/final-only UQ the live
+        # plasma is whatever the solver touched LAST (an internal candidate/probe
+        # reconstruction, not the selected best eval), while par.params/X_dvs point
+        # at the best -- then EVERY scan column inherits the same baseline offset
+        # (obs_plus - obs0_stale)/step, and the profile stds blow up by
+        # |offset|*sqrt(n_cols) (seen as an unphysical aLte tail band).  Detect by
+        # rebuilding the profiles at x0 (cheap, no transport) and comparing; on
+        # mismatch, drop the reuse so scan_with_observables re-evaluates the
+        # baseline for real (1 extra transport eval, usually cache-warm).
+        stale = None
+        for ch in powerstate.predicted_channels:
+            key = f"aL{ch}"
+            if key not in powerstate.plasma:
+                continue
+            pb = st._profile_probe(x0, key)
+            if pb is None:
+                continue
+            cur = powerstate.plasma[key].reshape(-1)
+            rel = float((pb - cur).abs().max() / max(float(cur.abs().max()), 1.0))
+            if rel > 0.05:
+                stale = (key, rel)
+                break
+        if stale is not None:
+            print(f"[UQ] STALE baseline detected ({stale[0]} rebuild differs "
+                  f"{stale[1]*100:.0f}% from live plasma) -> re-evaluating baseline "
+                  "at x0 instead of reusing the last eval", typeMsg="w")
+            baseline = None
         # Adaptive fit-error step: full step (clean flux, no 1/step noise blow-up)
         # for directions where the reconstruction is linear; small step only for
         # the few that cross a regime boundary.  Cheap profile-only probes.
@@ -407,6 +501,25 @@ def run_edge_uq(
             if k not in flux_set:                    # non-flux observable -> plot key
                 inject_into.plasma[k + profile_std_suffix] = sig
             profile_std[k] = sig
+
+        # Diagnostic per-rho propagated transport-flux std for the flux-panel band.
+        # Written to "{base}_tr_stds" -- the exact key the edge plotter reads FIRST
+        # for the modeled-flux band -- so the band shows the SAME propagated
+        # uncertainty the "var. frac." breakdown row decomposes (its per-bar total
+        # sigma = std_from_factor(L_obs[*_tr_turb]) is byte-identical to this).
+        # PLOT-ONLY: "{base}_tr_stds" is NOT an OF_FLUX_KEYS training key, so unlike
+        # inject_training_stds this never pollutes the surrogate GP training noise.
+        # Turbulent-transport only, matching the (turbulent) breakdown key; extend
+        # to turb+neoc here AND in the breakdown row together if that changes.
+        for ch in powerstate.predicted_channels:
+            fk = obj.OF_FLUX_KEYS.get(ch, ())
+            turb_key = fk[0] if fk else None
+            if turb_key is None or turb_key not in L_obs:
+                continue
+            sig_tr = std_from_factor(L_obs[turb_key]).reshape(
+                powerstate.plasma[turb_key].shape)
+            base_tr = turb_key[:-len("_turb")]        # "..._tr_turb" -> "..._tr"
+            inject_into.plasma[base_tr + "_stds"] = sig_tr
 
     # 4b. Per-source uncertainty breakdown: each column of the observable factor
     # is one uncertainty source, so the per-source std contribution is available

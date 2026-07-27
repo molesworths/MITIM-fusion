@@ -328,9 +328,12 @@ class power_transport:
             print(f"\t* File {self.folder / file_name} does not exist, cannot populate powerstate.plasma", typeMsg='w')
             print(f"\t- Tranforming from GB to real units:")
             
+            def _np(a):
+                return a.detach().cpu().numpy() if torch.is_tensor(a) else np.asarray(a)
             for var in mapper:
-                self.powerstate.plasma[f"{mapper[var][1]}_tr_{suffix}"] = self.__dict__[f"{var}_{suffix}"] * self.powerstate.plasma[f"{mapper[var][0]}"][0,1:]
-                self.powerstate.plasma[f"{mapper[var][1]}_tr_{suffix}_stds"] = self.__dict__[f"{var}_{suffix}_stds"] * self.powerstate.plasma[f"{mapper[var][0]}"][0,1:]
+                gb = _np(self.powerstate.plasma[f"{mapper[var][0]}"][0, 1:])
+                self.powerstate.plasma[f"{mapper[var][1]}_tr_{suffix}"] = _np(self.__dict__[f"{var}_{suffix}"]) * gb
+                self.powerstate.plasma[f"{mapper[var][1]}_tr_{suffix}_stds"] = _np(self.__dict__[f"{var}_{suffix}_stds"]) * gb
 
             return
         

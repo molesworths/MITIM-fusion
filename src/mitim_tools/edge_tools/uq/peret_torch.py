@@ -85,6 +85,15 @@ def _solve_lambda_p_value(gamma, rho_s, Lpar, g, Lambda, f_Delta, alpha_s):
     return 0.5 * (lo + hi)
 
 
+# Physical floor on g = G0*rho_s/R0. In the small-g regime (small rho_s, or the
+# degenerate G0=1 equilibrium fallback) the ExB term alpha_ExB ~ 1/sqrt(g) diverges and
+# the SSF residual lp/rho_s - rhs(lp) loses its lambda_p root (rhs < lhs everywhere).
+# Clamping g to G_MIN keeps the model in the regime where a physical root exists;
+# _g_floor_events logs the raw g each time the floor bites so callers can flag it.
+G_MIN = 1.0e-3
+_g_floor_events = []
+
+
 def ssf_decay_lengths_torch(
     *,
     te: torch.Tensor,          # LCFS electron temperature [keV] (differentiable)
@@ -115,6 +124,9 @@ def ssf_decay_lengths_torch(
         - 0.5 * torch.log(1.0 + ti / te)
     gamma = 2.0 * gamma_0 / 3.0
     g = G0 * rho_s / R0
+    if float(g.detach()) < G_MIN:
+        _g_floor_events.append(float(g.detach()))
+        g = torch.clamp(g, min=G_MIN)
 
     # ---- value: bracketed solve on detached scalars ----
     lp_star = _solve_lambda_p_value(

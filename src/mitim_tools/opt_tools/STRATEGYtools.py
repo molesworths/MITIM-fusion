@@ -678,6 +678,21 @@ class MITIM_BO:
 
         timeBeginning = datetime.datetime.now()
 
+        # edge_uq_final_only (default ON): the PORTALSedge per-eval edge-UQ hook fires
+        # run_edge_uq on EVERY model evaluation whenever optimization_object
+        # ._edge_uq_inputs is set -- expensive and only needed on the SOLUTION.  Stash
+        # that attribute for the duration of the loop to suppress the hook; the single
+        # end-of-run UQ then runs ONCE on the best evaluation (mirrors calm_minimal).
+        # Set optimization_object._edge_uq_final_only = False to keep per-eval UQ.
+        self._edge_uq_inputs_stashed = None
+        _oo = self.optimization_object
+        if (getattr(_oo, "_edge_uq_inputs", None) is not None
+                and getattr(_oo, "_edge_uq_final_only", True)):
+            self._edge_uq_inputs_stashed = _oo._edge_uq_inputs
+            _oo._edge_uq_inputs = None
+            print("\t- MITIM: edge_uq_final_only ON -> per-eval edge-UQ suppressed; "
+                  "run_edge_uq will run ONCE on the best eval at the end", typeMsg="i")
+
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
         # ~~~~~~~~ Initialization
         # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -841,8 +856,75 @@ class MITIM_BO:
 
         self.save()
 
+        # edge_uq_final_only: the single, end-of-run UQ on the best evaluation, then
+        # restore the stashed attribute (in-memory consistency for any reuse).
+        if self._edge_uq_inputs_stashed is not None:
+            try:
+                self._run_final_edge_uq()
+            except Exception as e:
+                print(f"\t- MITIM: final edge-UQ failed ({type(e).__name__}: {e})",
+                      typeMsg="w")
+            finally:
+                self.optimization_object._edge_uq_inputs = self._edge_uq_inputs_stashed
+
         print(f"- Complete MITIM workflow took {IOtools.getTimeDifference(timeBeginning)} ~~")
         print("********************************************************\n")
+
+    def _run_final_edge_uq(self):
+        """edge_uq_final_only: run run_edge_uq ONCE on the best real evaluation and
+        re-store its bands into optimization_extra.pkl so mitim_plot_portals_edge
+        (which reads mitim_runs powerstates from there) shows them.  Mirrors
+        calm_minimal._run_final_edge_uq; the per-eval PORTALSedge hook was suppressed
+        during the loop by stashing optimization_object._edge_uq_inputs."""
+        from mitim_tools.edge_tools.uq.run import run_edge_uq
+        oo = self.optimization_object
+
+        # best real eval = min residual (SBOcorrections convention), aligned with
+        # train_X and the optimization_extra powerstate store.
+        ibest = self.BOmetrics.get("overall", {}).get("indBest", None)
+        if ibest is None:
+            _, _, obj = _scalarized_objective_with_X(
+                oo, torch.from_numpy(self.train_Y), self.train_X)
+            ibest = int(torch.argmax(obj).item())
+        ibest = int(ibest)
+
+        if self.optimization_extra is None or not Path(self.optimization_extra).exists():
+            print("\t- MITIM: final edge-UQ skipped (no optimization_extra.pkl)", typeMsg="w")
+            return
+        dictStore = IOtools.unpickle_mitim(self.optimization_extra)
+        if ibest not in dictStore or "powerstate" not in dictStore[ibest]:
+            print(f"\t- MITIM: final edge-UQ skipped (no powerstate for best eval {ibest})",
+                  typeMsg="w")
+            return
+        ps = dictStore[ibest]["powerstate"]
+
+        uq_opts = dict(getattr(oo, "_edge_uq_options", {}) or {})
+        for key in ("inject_into", "start_after_eval"):
+            uq_opts.pop(key, None)
+        folder = uq_opts.pop("folder", self.folderOutputs / "edge_uq_best")
+        X = torch.from_numpy(np.atleast_2d(self.train_X[ibest])).to(self.dfT)
+
+        print(f"\t- MITIM: running final edge-UQ ONCE on best eval {ibest}", typeMsg="i")
+        last = run_edge_uq(ps, self._edge_uq_inputs_stashed, X_dvs=X, inject_into=ps,
+                           folder=folder, **uq_opts)
+        oo._edge_uq_last = last
+        if not hasattr(oo, "_edge_uq_history"):
+            oo._edge_uq_history = []
+        oo._edge_uq_history.append((ibest, last))
+
+        # Re-store the best powerstate (now carrying the {key}_uq_std / _edge_uq_summary
+        # / _edge_uq_breakdown that run_edge_uq injected in-memory) so the plotter finds
+        # them.  run_edge_uq mutated `ps` in place; ps IS dictStore[ibest]["powerstate"].
+        dictStore[ibest]["powerstate"] = ps
+        with open(self.optimization_extra, "wb") as h:
+            pickle_dill.dump(dictStore, h, protocol=4)
+        try:
+            with open(self.folderOutputs / "edge_uq_best.pkl", "wb") as h:
+                pickle_dill.dump({"ibest": ibest, "result": last}, h, protocol=4)
+            print("\t- MITIM: final edge-UQ saved (optimization_extra.pkl + "
+                  "Outputs/edge_uq_best.pkl)", typeMsg="i")
+        except Exception as e:
+            print(f"\t- MITIM: could not pickle edge_uq_best ({e})", typeMsg="w")
 
     def prepare_for_save_MITIMBO(self, copyClass):
         """

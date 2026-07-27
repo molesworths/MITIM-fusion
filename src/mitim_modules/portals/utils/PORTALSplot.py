@@ -1534,12 +1534,24 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
                 tr_std = _edge_extract_profile_1d(std_src, spec["tr_stds"],
                                                   species_index=species_idx_tr)
                 if tr_std is None:
-                    tr_turb_std = _edge_extract_profile_1d(std_src, spec["tr_turb_stds"],
-                                                           species_index=species_idx_tr)
-                    tr_neoc_std = _edge_extract_profile_1d(std_src, spec["tr_neoc_stds"],
-                                                           species_index=species_idx_tr)
-                    if tr_turb_std is not None and tr_neoc_std is not None:
-                        tr_std = tr_turb_std + tr_neoc_std
+                    # Prefer the PROPAGATED edge-UQ std (identical to the "var. frac."
+                    # breakdown row's per-bar total sigma = std_from_factor(L_obs
+                    # [*_tr_turb])) so the band and that row are consistent.  Only if
+                    # no breakdown exists fall back to the transport model's own
+                    # reported turb+neoc noise (much smaller; not the input-UQ).
+                    _bd = getattr(std_src, "_edge_uq_breakdown", None)
+                    _turb_key = spec["tr_turb_stds"][:-5]  # "..._tr_turb_stds"->"..._tr_turb"
+                    if (isinstance(_bd, dict) and _turb_key in _bd
+                            and isinstance(_bd[_turb_key], dict)
+                            and "__total__" in _bd[_turb_key]):
+                        tr_std = _edge_to_numpy(_bd[_turb_key]["__total__"]).reshape(-1)
+                    else:
+                        tr_turb_std = _edge_extract_profile_1d(std_src, spec["tr_turb_stds"],
+                                                               species_index=species_idx_tr)
+                        tr_neoc_std = _edge_extract_profile_1d(std_src, spec["tr_neoc_stds"],
+                                                               species_index=species_idx_tr)
+                        if tr_turb_std is not None and tr_neoc_std is not None:
+                            tr_std = tr_turb_std + tr_neoc_std
 
                 if tr_std is not None and idx == indexToMaximize:
                     axes_flux[j].fill_between(x, tr - z_ci * tr_std, tr + z_ci * tr_std,
@@ -1733,31 +1745,51 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
         pass
     ax_metric2.legend(prop={"size": fontsize_leg * 1.2}, loc="best")
 
-    # --- Col 4: Zeff at rho_min vs iteration ---
-    zeff_at_rhomin = []
-    for ps in self.powerstates:
+    # --- Col 4 (row 2): DV trajectory -- ||DVs||_2 vs objective (log-x scatter) ---
+    # Each point is one evaluation; annotated by iteration number.  As the
+    # objective -> 0 the points crowd toward small x with d||DVs||/d(objective)
+    # collapsing (diminishing DV motion near the optimum).
+    try:
+        import torch
+        _tx = getattr(self, "step", None)
+        _tx = _tx.train_X if _tx is not None else None
+        dvs = (_tx.detach().cpu().numpy() if torch.is_tensor(_tx)
+               else (np.asarray(_tx) if _tx is not None else None))
+        if dvs is None or dvs.ndim != 2:
+            raise ValueError("train_X unavailable for DV-norm panel")
+        dv_norm = np.linalg.norm(dvs, axis=1)
+        obj = np.asarray(self.resM, dtype=float)
+        its = np.asarray(self.evaluations)
+        n = min(len(dv_norm), len(obj), len(its))
+        dv_norm, obj, its = dv_norm[:n], obj[:n], its[:n]
+        good = np.isfinite(obj) & np.isfinite(dv_norm) & (obj > 0)
+        xg, yg = obj[good], dv_norm[good]
+        # Objective uncertainty (edge-UQ sigma_J) as horizontal error bars, where
+        # available (UQ-bearing iterations); log-safe asymmetric so the lower
+        # whisker stays positive on the log-x axis.
+        sig_OF = None
         try:
-            # plasma["Zeff"] is updated each iteration; profiles.derived["Zeff"] is static
-            if "Zeff" in ps.plasma and ps.plasma["Zeff"] is not None:
-                import torch
-                _zeff_t = ps.plasma["Zeff"]
-                _rho_t  = ps.plasma["rho"]
-                _zeff_np = _zeff_t[0].detach().cpu().numpy() if torch.is_tensor(_zeff_t) else np.asarray(_zeff_t[0])
-                _rho_np  = _rho_t[0].detach().cpu().numpy()  if torch.is_tensor(_rho_t)  else np.asarray(_rho_t[0])
-                zeff_at_rhomin.append(float(np.interp(xlim[0], _rho_np, _zeff_np)))
-            else:
-                _rho_prof = np.asarray(ps.profiles.profiles["rho(-)"], dtype=float)
-                _zeff_prof = np.asarray(ps.profiles.derived["Zeff"], dtype=float)
-                zeff_at_rhomin.append(float(np.interp(xlim[0], _rho_prof, _zeff_prof)))
+            _s = np.asarray(_edge_residual_uq(self).get("OF"), dtype=float)
+            if _s.size >= n:
+                sig_OF = _s[:n][good]
         except Exception:
-            zeff_at_rhomin.append(np.nan)
-    ax_metric3.plot(self.evaluations, zeff_at_rhomin, "-o", lw=1.0, c="olive", ms=2,
-                    label=f"$Z_{{eff}}(\\rho={xlim[0]:.2f})$")
-    ax_metric3.set_ylabel("$Z_{eff}$", fontsize=ylabel_fontsize, labelpad=ylabel_pad)
-    ax_metric3.set_xlabel("Iterations")
-    ax_metric3.set_xlim(left=0)
-    GRAPHICStools.addDenseAxis(ax_metric3, n=5)
-    ax_metric3.legend(prop={"size": fontsize_leg * 1.2}, loc="best")
+            sig_OF = None
+        if sig_OF is not None:
+            m = np.isfinite(sig_OF) & (sig_OF > 0)
+            if m.any():
+                ax_metric3.errorbar(xg[m], yg[m],
+                                    xerr=_edge_log_yerr(xg[m], sig_OF[m]),
+                                    fmt="none", ecolor="teal", elinewidth=0.8,
+                                    capsize=2, alpha=0.55, zorder=2)
+        ax_metric3.scatter(xg, yg, s=16, c="teal",
+                           edgecolor="white", linewidth=0.4, zorder=3)
+        ax_metric3.set_ylabel(r"$\|\mathrm{DVs}\|_2$", fontsize=ylabel_fontsize,
+                              labelpad=ylabel_pad)
+        ax_metric3.set_xlabel("Objective")
+        GRAPHICStools.addDenseAxis(ax_metric3, n=5)
+        ax_metric3.set_xscale("log")   # after addDenseAxis so the scale sticks
+    except Exception as e:
+        print(f"\t- DV-norm trajectory panel skipped: {e}", typeMsg="w")
 
     if file_save is not None:
         plt.savefig(file_save, transparent=True, dpi=300)

@@ -90,14 +90,14 @@ solution:
   # Physics-informed parameters to fit surrogates (numbers are the last iteration to consider that line; keys are the physics-informed parameters
   # and the values are the corresponding variables to check if they have varied, that affect that input)
   portals_transformation_variables:
-    5: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0]}
-    10: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0]}
+    20: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0]}
+    100: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0]}
     10000: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], beta_e: [te, ne]}
 
   # Physics-informed parameters to fit surrogates for trace impurities
   portals_transformation_variables_trace:
-    5: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], aLnZ: [aLnZ]}
-    10: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], aLnZ: [aLnZ]}
+    20: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], aLnZ: [aLnZ]}
+    100: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], aLnZ: [aLnZ]}
     10000: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], beta_e: [te, ne], aLnZ: [aLnZ]}
 
 # -----------------------------------------------------------------

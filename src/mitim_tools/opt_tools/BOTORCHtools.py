@@ -198,6 +198,14 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
             self.mean_module = MITIM_CriticalGradientMean(
                 batch_shape=self._aug_batch_shape, variables=variables, output=output
             )
+        elif TypeMean == 4:
+            # Physics-driver mean for the nonstationary ExB-suppression flux surrogate:
+            # affine in the precomputed structured log-flux feature mu_exb. Imported lazily
+            # to avoid a circular import (exb_nonstationary imports BOTORCHtools).
+            from mitim_tools.edge_tools.exb_nonstationary import ExBPhysicsDriverMean
+            self.mean_module = ExBPhysicsDriverMean(
+                batch_shape=self._aug_batch_shape, variables=variables, output=output
+            )
 
         """
 		-----------------------------------------------------------------------
@@ -218,11 +226,26 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
         self._subset_batch_dict["covar_module.raw_outputscale"] = -1
         self._subset_batch_dict["covar_module.base_kernel.raw_lengthscale"] = -3
 
+        # Nonstationary ExB surrogate: route the physics driver features to the MEAN only, not the
+        # ARD kernel, so the residual kernel dimensionality (and its sample requirement) is exactly
+        # the standard flux GP's. The named features are dropped from the kernel via active_dims; the
+        # mean still indexes the full (normalized) feature vector.
+        kernel_ard_dims = self.ard_num_dims
+        kernel_active_dims = None
+        mean_only = surrogate_options.get("kernel_mean_only_features", None)
+        if mean_only and (variables is not None) and (len(variables) == self.ard_num_dims):
+            excl = {i for i, v in enumerate(variables) if v in mean_only}
+            if 0 < len(excl) < self.ard_num_dims:
+                kept = [i for i in range(self.ard_num_dims) if i not in excl]
+                kernel_active_dims = torch.tensor(kept, dtype=torch.long)
+                kernel_ard_dims = len(kept)
+
         if TypeKernel == 0:
             self.covar_module = gpytorch.kernels.scale_kernel.ScaleKernel(
                 base_kernel=gpytorch.kernels.matern_kernel.MaternKernel(
                     nu=2.5,
-                    ard_num_dims=self.ard_num_dims,
+                    ard_num_dims=kernel_ard_dims,
+                    active_dims=kernel_active_dims,
                     batch_shape=self._aug_batch_shape,
                     lengthscale_prior=lengthscale_prior,
                     lengthscale_constraint=lengthscale_constraint,
@@ -233,7 +256,8 @@ class ExactGPcustom(botorch.models.gp_regression.SingleTaskGP):
         elif TypeKernel == 1:
             self.covar_module = gpytorch.kernels.scale_kernel.ScaleKernel(
                 base_kernel=gpytorch.kernels.rbf_kernel.RBFKernel(
-                    ard_num_dims=self.ard_num_dims,
+                    ard_num_dims=kernel_ard_dims,
+                    active_dims=kernel_active_dims,
                     batch_shape=self._aug_batch_shape,
                     lengthscale_prior=lengthscale_prior,
                     lengthscale_constraint=lengthscale_constraint,

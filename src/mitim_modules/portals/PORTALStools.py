@@ -28,6 +28,17 @@ def surrogate_selection_portals(output, surrogate_options):
             if surrogate_options.get("global_surrogates", False) and ("_tr_turb" in output):
                 surrogate_options["TypeKernel"] = 0  # Matern 5/2
 
+            # Nonstationary ExB-suppression surrogate (L->H transition) on the heat channels:
+            # physics-driver mean (mu_exb) + ARD Matern-5/2 residual + heteroscedastic noise, in
+            # ln(GB flux) space (outcome transform selected in SURROGATEtools). See exb_nonstationary.
+            from mitim_tools.edge_tools import exb_nonstationary
+            if surrogate_options.get("nonstationary_exb", False) and exb_nonstationary.is_exb_channel(output):
+                surrogate_options["TypeMean"] = exb_nonstationary.TYPEMEAN_EXB
+                surrogate_options["TypeKernel"] = 0      # Matern 5/2 residual
+                surrogate_options["FixedNoise"] = True   # heteroscedastic (per-point) noise
+                # physics driver features feed the mean only -> unchanged residual-kernel dimensionality
+                surrogate_options["kernel_mean_only_features"] = list(exb_nonstationary.MEAN_ONLY_FEATURES)
+
     surrogate_options["additional_constraints"] = {
         'lenghtscale_constraint': gpytorch.constraints.constraints.GreaterThan(0.05) # inputs normalized to [0,1], this is  5% lengthscale
     }

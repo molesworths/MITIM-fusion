@@ -305,9 +305,29 @@ class surrogate_model:
         input_transform_physics = BOTORCHtools.Transformation_Inputs(
             self.output, self.surrogate_parameters, self.surrogate_transformation_variables
         ).to(self.dfT)
-        outcome_transform_physics = BOTORCHtools.Transformation_Outcomes(
-            dimY, self.output, self.surrogate_parameters
-        ).to(self.dfT)
+
+        # Nonstationary ExB-suppression flux surrogate: model ln(GB flux) so the ITG turn-on x ExB
+        # suppression product becomes an additive tent, with a lognormal back-transform. The signed
+        # asinh variant is selected DATA-DRIVEN: whenever the training set has negative flux (always
+        # for Ge's inward pinch, but foot heat channels can also go negative), because the ln path
+        # would clamp those points to the floor and distort the fit.
+        from mitim_tools.edge_tools import exb_nonstationary
+        if self.surrogate_options.get("nonstationary_exb", False) and exb_nonstationary.is_exb_channel(self.output):
+            signed, scale = exb_nonstationary.is_signed_channel(self.output), 1.0
+            if self.train_Y.shape[0] > 0:
+                factor = self.surrogate_parameters["transformationOutputs"](
+                    self.train_X, self.surrogate_parameters, self.output
+                ).to(self.train_X.device)
+                signed = signed or bool((self.train_Y / factor).min() < 0)
+                if signed:
+                    scale = exb_nonstationary.compute_asinh_scale(self.train_Y, factor)
+            outcome_transform_physics = exb_nonstationary.build_outcome_transform(
+                dimY, self.output, self.surrogate_parameters, self.dfT, scale=scale, signed=signed
+            )
+        else:
+            outcome_transform_physics = BOTORCHtools.Transformation_Outcomes(
+                dimY, self.output, self.surrogate_parameters
+            ).to(self.dfT)
 
         dimTransformedDV_x = input_transform_physics(self.train_X).shape[-1]
         dimTransformedDV_y = dimY
@@ -482,7 +502,13 @@ class surrogate_model:
             posterior = surrogate_model.gpmodel.posterior(X)
 
         mean = posterior.mean
-        lower, upper = posterior.mvn.confidence_region()
+        if hasattr(posterior, "mvn"):
+            lower, upper = posterior.mvn.confidence_region()
+        else:
+            # Non-Gaussian (e.g. lognormal TransformedPosterior of the ExB surrogate): build the
+            # +-2 std region from the transformed mean/variance directly (kept shape-aligned to mean).
+            std = posterior.variance.clamp_min(0.0).sqrt().reshape(mean.shape)
+            lower, upper = mean - 2.0 * std, mean + 2.0 * std
         samples = (
             posterior.rsample(sample_shape=torch.Size([nSamples]))
             if nSamples is not None

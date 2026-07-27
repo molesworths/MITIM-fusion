@@ -79,9 +79,10 @@
     ALPHA_MACH: 0
     SAT_RULE: 3
     UNITS: CGYRO
-    USE_BPER: False
-    USE_BPAR: False
+    USE_BPER: True
+    USE_BPAR: True
     NBASIS_MAX: 12
     WIDTH: 3
-    WIDTH_MIN: 0.3
+    WIDTH_MIN: 0.1
     NMODES: 2
+    NXGRID: 32

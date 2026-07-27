@@ -30,6 +30,7 @@ from typing import Dict, List, Optional, Sequence
 
 import torch
 
+from mitim_tools.misc_tools import IOtools
 from mitim_tools.misc_tools.LOGtools import printMsg as print
 from mitim_tools.edge_tools.uq import propagate
 from mitim_tools.edge_tools.uq.inputs import ScatterSpec
@@ -71,7 +72,7 @@ class UQState:
 
     def __init__(self, powerstate, X_dvs, layout: Dict, batch: int = 0,
                  stacked: bool = False, rotation_proxy: bool = True,
-                 transport_proxy=None):
+                 transport_proxy=None, folder=None):
         self.ps0 = powerstate
         self.X_dvs = X_dvs.detach()
         self.layout = layout
@@ -98,6 +99,15 @@ class UQState:
         # factor is then their difference (correlation preserved).  When False it
         # returns the signed residual P - P_tr directly.
         self.stacked = stacked
+        # Base folder for the real-model transport re-runs.  Each evaluation gets
+        # a UNIQUE subfolder ("uq_<tag>") so the remote scratch name (a
+        # deterministic hash of the LOCAL run path, IOtools.path_overlapping) is
+        # unique per column/pass.  Without this the re-runs default to
+        # calculate(folder="~/scratch/"), giving one CONSTANT remote folder shared
+        # by every UQ transport run across columns, evals AND concurrent discharge
+        # optimizations -> tarball collisions ("Not all received").  None keeps the
+        # legacy default (fine only when transport is a proxy / no remote runs).
+        self.folder = folder
 
     # ------------------------------------------------------------------ #
     # Scatter x0 back into a (fresh) powerstate
@@ -154,10 +164,17 @@ class UQState:
                 if amp == 0.0:
                     continue
                 opts = dict(getattr(ps, "_bc_model_options", {}) or {})
+                nominal = sc.meta.get("nominal", {})
                 for ch, d in sc.meta.get("delta", {}).items():
                     k = f"aL{ch}"
-                    if k in opts:
-                        opts[k] = opts[k] + amp * d
+                    # Seed from the current option value, else the nominal aLy BC
+                    # captured at build time.  Without the nominal fallback a
+                    # Fixed-nominal aLy with EMPTY _bc_model_options never has the
+                    # aL{ch} key, so the perturbation was silently dropped and the
+                    # PeretSSF-projected aLy uncertainty never reached the fit.
+                    base = opts.get(k, nominal.get(ch))
+                    if base is not None:
+                        opts[k] = base + amp * d
                 ps._bc_model_options = opts
                 ps._bc_model_instance = None
                 continue
@@ -187,14 +204,29 @@ class UQState:
             self.transport_proxy(ps)        # swap in fast differentiable transport
         return ps
 
-    def _residual(self, ps) -> torch.Tensor:
+    def _run_kwargs(self, tag=None) -> dict:
+        """calculate() folder/name kwargs giving this eval a UNIQUE run path when
+        ``self.folder`` is set (so the remote scratch hash is unique per eval);
+        empty dict (legacy ``~/scratch/`` default) when it is not."""
+        if self.folder is None:
+            return {}
+        sub = "base" if tag is None else str(tag)
+        run_folder = IOtools.expandPath(self.folder) / f"uq_{sub}"
+        run_folder.mkdir(parents=True, exist_ok=True)
+        return dict(folder=run_folder, nameRun=f"uq_{sub}",
+                    evaluation_number=(tag if isinstance(tag, int) else 0))
+
+    def _residual(self, ps, tag=None) -> torch.Tensor:
         """
         Run calculate() at the fixed DVs.  Returns the signed residual P - P_tr,
         or cat([P, P_tr]) when ``self.stacked`` (so target/transport can be split
         downstream).  The two halves of the stacked output share input columns, so
         differencing their factors preserves the target<->transport correlation.
+
+        ``tag`` selects a unique run subfolder (see ``_run_kwargs``) so concurrent
+        transport re-runs never share a remote scratch folder.
         """
-        P_tr, P, _S, _res = ps.calculate(self.X_dvs)
+        P_tr, P, _S, _res = ps.calculate(self.X_dvs, **self._run_kwargs(tag))
         P, P_tr = P.reshape(-1), P_tr.reshape(-1)
         if self.stacked:
             return torch.cat([P, P_tr])
@@ -215,7 +247,7 @@ class UQState:
         def fwd(x0):
             ps = copy.deepcopy(ps_base)
             self._scatter_torch(ps, x0)
-            return self._residual(ps)
+            return self._residual(ps, tag="torch")
 
         return fwd
 
@@ -274,15 +306,15 @@ class UQState:
 
         cols = []
         if mode == "forward":
-            r0 = self._eval_at(x0)                       # shared baseline
+            r0 = self._eval_at(x0, tag="base")           # shared baseline
             for c in bb_cols:
-                r_plus = self._eval_at(x0 + rel_step * L[:, c])
+                r_plus = self._eval_at(x0 + rel_step * L[:, c], tag=int(c))
                 cols.append((r_plus - r0) / rel_step)
             n_eval = len(bb_cols) + 1
         elif mode == "central":
             for c in bb_cols:
-                r_plus = self._eval_at(x0 + rel_step * L[:, c])
-                r_minus = self._eval_at(x0 - rel_step * L[:, c])
+                r_plus = self._eval_at(x0 + rel_step * L[:, c], tag=f"{int(c)}p")
+                r_minus = self._eval_at(x0 - rel_step * L[:, c], tag=f"{int(c)}m")
                 cols.append((r_plus - r_minus) / (2.0 * rel_step))
             n_eval = 2 * len(bb_cols)
         else:
@@ -317,10 +349,10 @@ class UQState:
         """
         if cols is None:
             cols = list(range(L.shape[1]))
-        r0 = baseline if baseline is not None else self._eval_at(x0)
+        r0 = baseline if baseline is not None else self._eval_at(x0, tag="base")
         out_cols = []
         for c in cols:
-            r_plus = self._eval_at(x0 + rel_step * L[:, c])
+            r_plus = self._eval_at(x0 + rel_step * L[:, c], tag=int(c))
             out_cols.append((r_plus - r0) / rel_step)
         L_out = torch.stack(out_cols, dim=1) if out_cols else \
             torch.zeros((r0.numel(), 0), dtype=x0.dtype)
@@ -411,22 +443,23 @@ class UQState:
               typeMsg="i")
         return steps
 
-    def _eval_full(self, x0: torch.Tensor):
-        """Evaluate at x0 and return (residual, evaluated_powerstate)."""
+    def _eval_full(self, x0: torch.Tensor, tag=None):
+        """Evaluate at x0 and return (residual, evaluated_powerstate).  ``tag``
+        selects a unique transport run subfolder (see ``_run_kwargs``)."""
         with torch.no_grad():
             ps = self._prep_ps(copy.deepcopy(self.ps0))
             self._scatter_blackbox(ps, x0)
             self._scatter_torch(ps, x0)
             self._scatter_theta(ps, x0)
-            res = self._residual(ps)
+            res = self._residual(ps, tag=tag)
             return res, ps
 
-    def _eval_at(self, x0: torch.Tensor) -> torch.Tensor:
+    def _eval_at(self, x0: torch.Tensor, tag=None) -> torch.Tensor:
         """Full residual at x0 (scatters both routes); no graph kept."""
-        return self._eval_full(x0)[0]
+        return self._eval_full(x0, tag=tag)[0]
 
     def _n_res(self, x0) -> int:
-        return self._eval_at(x0).numel()
+        return self._eval_at(x0, tag="nres").numel()
 
     @staticmethod
     def _observables(ps, keys):
@@ -463,7 +496,7 @@ class UQState:
             r0 = baseline
             obs0 = self._observables(self.ps0, obs_keys)
         else:
-            r0, ps0 = self._eval_full(x0)
+            r0, ps0 = self._eval_full(x0, tag="base")
             obs0 = self._observables(ps0, obs_keys)
 
         res_cols = []
@@ -471,7 +504,7 @@ class UQState:
         for c in cols:
             # per-column step: explicit map wins; else small-step set; else full
             step = col_steps.get(int(c), small_step if c in small else rel_step)
-            r_plus, ps_plus = self._eval_full(x0 + step * L[:, c])
+            r_plus, ps_plus = self._eval_full(x0 + step * L[:, c], tag=int(c))
             res_cols.append((r_plus - r0) / step)
             obsp = self._observables(ps_plus, obs_keys)
             for k in obs0:
