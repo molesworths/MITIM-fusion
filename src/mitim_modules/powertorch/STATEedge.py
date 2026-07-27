@@ -1048,7 +1048,8 @@ class powerstate_edge(powerstate):
         w0_override = self._rotation_w0_vgen(vtor) if opts.get("mode") == "vgen" else None
 
         nl = getattr(self, "_nonlocal_options", None)
-        want_fine = bool(nl and nl.get("ExB", True))
+        curv_inject = opts.get("exb_curvature_inject", False)
+        want_fine = bool(nl and nl.get("ExB", True)) or bool(curv_inject)
 
         # The nonlocal kernel integral needs the Er-well structure resolved
         # (lambda_c ~ grid spacing): raise the refinement floor to 4x unless the
@@ -1073,8 +1074,21 @@ class powerstate_edge(powerstate):
         if want_fine:
             from mitim_tools.edge_tools import nonlocality
             self._rotation_fine = out.pop("_fine")
-            p["gamma_exb_nl"] = nonlocality.compute_gamma_exb_nl(
-                self, self._rotation_fine, nl)
+            if nl and nl.get("ExB", True):
+                p["gamma_exb_nl"] = nonlocality.compute_gamma_exb_nl(
+                    self, self._rotation_fine, nl)
+            if curv_inject:
+                # Curvature-augmented VEXB_SHEAR injection: replace the local
+                # first-derivative shear (which vanishes at the Er-well extremum
+                # and leaves a spurious flux spike on the well knot) with the
+                # curvature-aware gamma_eff, fed to TGLF's OWN internal ExB. No
+                # external per-ky quench here (nonlocal module off) -> no double
+                # count. See Ch.6 (eq:rca-gamma-eff). CANDIDATE model (heuristic
+                # coefficient; gyrokinetic calibration pending).
+                cmult = curv_inject.get("lambda_c_mult", 8.0) if isinstance(curv_inject, dict) else 8.0
+                cinj = {"exb_envelope": "curvature", "lambda_c_mult": cmult, "kernel": "gauss"}
+                geff = nonlocality.compute_gamma_exb_nl(self, self._rotation_fine, cinj)
+                p["vexb_shear"] = torch.copysign(geff, p["vexb_shear"])
 
     def _rotation_inputs(self):
         """Assemble the kwargs consumed by ``rotation.calculate_rotation`` from the

@@ -36,7 +36,7 @@ Options (edge_options):
         "kernel": "gauss",          # "lorentzian" = MinT-draft variant
         "alpha_e": 1.0, "p": 2.0,   # quench-rule constants (ledger)
         "spread_lambda_mult": None, # spreading kernel C (default: lambda_c_mult)
-        "exb_envelope": None,       # None=rms | "gauss"/"lorentzian": single pedestal-wide bump
+        "exb_envelope": None,       # None=rms | "gauss"/"lorentzian": pedestal-wide bump | "curvature": gamma_eff w/ flow-curvature term
         "exb_envelope_window": (0.85, 1.0),
         "nonlocal_exb_to_tglf": False,  # (unwired) inject gamma_E into TGLF VEXB_SHEAR instead
         "gamma_exb_nl_feature": False,  # opt in: add smeared shear as a GP input feature
@@ -168,7 +168,20 @@ def compute_gamma_exb_nl(ps, rotation_fine, nl_options):
 
     r_f = (a * roa_f).detach()
     env_form = nl_options.get("exb_envelope")
-    if env_form:
+    if env_form == "curvature":
+        # Curvature-augmented effective shear (local finite-eddy form): the
+        # first-derivative gamma_E vanishes at the Er-well extremum, but an eddy
+        # of width lambda_c feels the shear averaged over its extent; a Taylor
+        # expansion of that average restores the missing flow-curvature term,
+        #   gamma_eff = sqrt( gamma_E^2 + (lambda_c^2/12) (d gamma_E/dr)^2 ),
+        # with d gamma_E/dr propto d^2 omega0/dr^2. Local (needs only gamma_E and
+        # its gradient), fills the notch via curvature, reduces to |gamma_E| where
+        # the shear is large. See Ch.6 (eq:rca-gamma-eff). CAVEAT: the derivative
+        # is effectively a 3rd pressure derivative (omega0 ~ dp_i/dr) and the 1/12
+        # coefficient is heuristic (gyrokinetic calibration pending).
+        dg = torch.gradient(gexb_f, spacing=(r_f,), dim=-1)[0]   # (batch,n_f) [1/s/m]
+        gexb_eff_f = torch.sqrt(gexb_f ** 2 + (lam ** 2 / 12.0) * dg ** 2)
+    elif env_form:
         # Reduced single-envelope model: fit one smooth bump to |gamma_E| per
         # batch element (scipy, on the fine grid) -> replaces both the notch and
         # the local variation with a monotone-in-radius profile. DETACHED: the
