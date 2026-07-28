@@ -1,3 +1,7 @@
 "Sonic":
   controls:
     ROTATION_MODEL: 2
+
+"edge":
+  controls:
+    ROTATION_MODEL: 1

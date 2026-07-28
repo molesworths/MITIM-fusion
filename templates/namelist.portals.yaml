@@ -110,6 +110,12 @@ transport:
   evaluator: "import::mitim_modules.powertorch.utils.TRANSPORTtools.portals_transport_model"
 
   # Select transport models (when instantiating the evaluator, assign these parameters)
+  # Both models can also be specified PER RADIAL LOCATION (tied to predicted_roa/predicted_rho):
+  #   turbulence_model: ["tglf", "tglf", "cgyro", "cgyro"]   # one entry per predicted radius
+  #   turbulence_model: {0.85: "tglf", 0.95: "cgyro"}        # keyed by r/a (or rho)
+  #   turbulence_model: {0: "tglf", 3: "cgyro"}              # keyed by radial index
+  #   turbulence_model: {"default": "tglf", 0.95: "cgyro"}   # partial spec + fallback
+  # Each distinct code is then run once over the radii assigned to it, in its own subfolder
   evaluator_instance_attributes:
 
     # Turbulent transport model

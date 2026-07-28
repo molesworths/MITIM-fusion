@@ -177,6 +177,9 @@ class SALM:
         # rho_hi-only growth).
         tr_grow_boundary_frac=0.9,
         tr_resets=1,             # the one loop-side rescue kept (proven useful)
+        tr_base_relative=True,   # TR step ~ tr_rel * |base DV| (opt space), box-independent.
+        tr_scale_floor=0.1,      # floor on the per-DV base scale (guards near-zero base DVs)
+        seed_lhs_base_relative=True,  # LHS seed band ~ frac * |base DV|, box-independent
         # FIXED Levenberg ridge toward the anchor over interior DVs (uniqueness on
         # the collinear driver ridge); not adapted. 0 disables.
         lm_ridge_rel=1e-2,
@@ -708,7 +711,16 @@ class SALM:
         if m <= 0 or idx.size == 0 or frac <= 0.0:
             return seeds
         rng = np.random.default_rng(int(self.options.get("seed_lhs_seed", 0)))
-        span = (self.dvs_max - self.dvs_min)[idx]
+        # Band scale. DEFAULT base-relative (frac * |base DV|), box-INDEPENDENT -- the
+        # legacy box-relative `frac * (dvs_max-dvs_min)` blows up on wide/absolute bounds
+        # (e.g. [0,100] -> frac 0.25 = +-25 in aLy -> clips gradients to 0 -> unphysical
+        # seeds). Set seed_lhs_base_relative=False for the legacy box-relative band.
+        if self.options.get("seed_lhs_base_relative", True):
+            span = np.maximum(np.abs(self.dvs_base[idx]), 1e-2)
+            band_desc = "of |base DV|"
+        else:
+            span = (self.dvs_max - self.dvs_min)[idx]
+            band_desc = "of DV range"
         # LHS in [-1, 1]^d (space-filling around x0), one row per extra seed
         U = np.zeros((m, idx.size))
         for j in range(idx.size):
@@ -719,7 +731,7 @@ class SALM:
             x[idx] = np.clip(x[idx] + U[k] * frac * span, self.dvs_min[idx], self.dvs_max[idx])
             seeds.append(x)
         print(f"\t- SALM: LHS seed -- base x0 + {m} banded LHS points "
-              f"(frac={frac:.3f} of DV range); loop travels via TR growth", typeMsg="i")
+              f"(frac={frac:.3f} {band_desc}); loop travels via TR growth", typeMsg="i")
         return seeds
 
     # ==================================================================
@@ -812,7 +824,21 @@ class SALM:
 
         lo, hi = self._opt_space_bounds()
         self._lo, self._hi = np.minimum(lo, hi), np.maximum(lo, hi)
-        self._dv_scale = np.maximum(self._hi - self._lo, 1e-6)
+        # Trust-region step scale. DEFAULT: BASE-RELATIVE -- tr_rel is a fraction of the
+        # base DV magnitude (in opt space), so the TR step is INDEPENDENT of the DV box
+        # width. Widening/opening the bounds no longer silently rescales tr_min/tr_init
+        # (the legacy box-relative scale made tr_min=1e-2 mean ~1% of base only for the
+        # then-current bounds; a wider box turned it into a much coarser step -> surrogate
+        # mispredict -> TR-floor stall). Set tr_base_relative=False to recover the legacy
+        # box-relative behavior.
+        if self.options.get("tr_base_relative", True):
+            x0_opt = forward_transform(
+                torch.as_tensor(np.asarray(self.dvs_base, dtype=float)).to(self.dfT),
+                self.mono_pairs).detach().cpu().numpy()
+            self._dv_scale = np.maximum(np.abs(x0_opt),
+                                        float(self.options.get("tr_scale_floor", 0.1)))
+        else:
+            self._dv_scale = np.maximum(self._hi - self._lo, 1e-6)
 
         i_best = int(np.argmin(seed_f))
         x_start = np.asarray(seeds[i_best], dtype=float)

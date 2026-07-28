@@ -226,9 +226,13 @@ def calculateNonlocal(ps, folder, nl_options):
     # 1. ExB quench (per-ky, from the shear-free run's own spectra)
     # ------------------------------------------------------------------ #
     if nl_options.get("ExB", True):
+        # turbulence_model may be per-radius (str, list or dict); the per-ky quench
+        # needs TGLF spectra at EVERY radius, and only then are the decks under the
+        # legacy folder/base_tglf path this parser reads.
+        from mitim_modules.powertorch.utils.TRANSPORTtools import unique_models
         turb_model = (ps.transport_options.get("evaluator_instance_attributes", {})
                       or {}).get("turbulence_model", "tglf")
-        if turb_model != "tglf":
+        if unique_models(turb_model) != {"tglf"}:
             raise NotImplementedError(
                 f"[nonlocality] per-ky quench implemented for TGLF only "
                 f"(got {turb_model!r}); QLGYRO needs its native QL-file parser "

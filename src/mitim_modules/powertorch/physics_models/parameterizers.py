@@ -1572,18 +1572,30 @@ class SplineMtanhAnalytic(ParameterBase):
         # Fixed defaults for the non-c solver components.
         self.s0 = float(options.get('s0', 0.5))
         self.w1_0 = float(options.get('w1_0', 0.02))
-        # Runaway tail-peak guard. A flat interior with a steep last-knot/LCFS jump can
-        # make the mtanh backbone overshoot inside (0.97,1) to many x its neighbours
-        # (e.g. aLne ~100 with knots ~20) even at the physical w1 floor. When the fitted
-        # backbone peak exceeds fit_peak_kappa * max(aLy(last knot), aLy(1)), a single
-        # penalized LM re-fit (soft ReLU on the excess at fit_peak_x) pulls it back under
-        # the cap. Gated on detection -> real, non-runaway fits never re-fit (byte-identical)
-        # and pay only one cheap peak evaluation. The corrector still pins the interior
-        # knots, so the re-fit only reshapes the over-peaked tail.
+        # Runaway peak guard. A flat interior with a steep last-knot/LCFS jump can make
+        # the mtanh backbone overshoot to many x its neighbours (e.g. aLne ~100 with knots
+        # ~20) even at the physical w1 floor. When the fitted backbone peak exceeds
+        # fit_peak_kappa * max(aLy(knots), aLy(1)) (see _peak_cap), a single penalized LM
+        # re-fit (soft ReLU on the excess at _peak_x) pulls it back under the cap. Gated on
+        # detection -> real, non-runaway fits never re-fit (byte-identical) and pay only one
+        # cheap peak evaluation. The corrector still pins the interior knots, so the re-fit
+        # only reshapes the over-peaked region.
+        # The sample grid spans the WHOLE parameterizer domain [x0,1], not just the
+        # near-LCFS foot: a solver-driven peak sitting on an interior knot (aLy(0.97) >>
+        # aLy_lcfs is legitimate, if not pretty) was invisible to a foot-only window, and
+        # so was any UQ excursion that moved the peak inboard of it.
         self._peak_penalty_on = bool(options.get('fit_peak_penalty', True))
         self.fit_peak_kappa = float(options.get('fit_peak_kappa', 2.0))
         self.fit_peak_weight = float(options.get('fit_peak_weight', 5.0))
-        self._peak_x = np.linspace(0.971, 0.998, 8)
+        self.peak_proj_iters = int(options.get('fit_peak_proj_iters', 12))
+        # Also reject the dip-then-peak (turnover) shape when projecting a UQ theta
+        # offset. Applies to the perturbation only -- a nominal fit that already dips is
+        # left alone (see _apply_theta_offset).
+        self._unimodal_proj_on = bool(options.get('fit_unimodal_proj', True))
+        self._peak_x = np.unique(np.concatenate([
+            np.linspace(self.x0, 0.96, 16, endpoint=False),
+            np.linspace(0.96, 1.0 - 1e-6, 48),
+        ]))
         # Theta stashed by the most recent _resolve, keyed by profile; the torch
         # overlay reads s from here to keep A live in the BCs (see below).
         self._current_theta: Dict[str, np.ndarray] = {}
@@ -1957,14 +1969,48 @@ class SplineMtanhAnalytic(ParameterBase):
         rel = np.abs(aLy_val - aLy_k) / np.maximum(np.abs(aLy_k), 1e-3)
         return float(np.max(rel)) if rel.size else np.inf
 
-    def _tail_peak(self, theta, y_bc, aLy_bc) -> float:
-        """Max backbone aLy over the (0.97,1) tail sample points -- the quantity the
-        runaway guard caps. Cheap (one _pedestal_eval_all on ~8 points)."""
+    def _backbone_aLy(self, theta, y_bc, aLy_bc) -> np.ndarray:
+        """Backbone aLy on the full-domain guard grid. Cheap (one _pedestal_eval_all
+        on ~64 points); the shared primitive behind the peak and dip diagnostics."""
         s, c, w1, rho = (float(v) for v in theta)
         r, _, _ = self._rho_c_to_r(rho, c)
         with np.errstate(over="ignore", invalid="ignore"):
             _, aLy_p, *_ = _pedestal_eval_all(self._peak_x, s, c, w1, r, self.x0, y_bc, aLy_bc)
+        return np.nan_to_num(np.asarray(aLy_p, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _profile_peak(self, theta, y_bc, aLy_bc) -> float:
+        """Max backbone aLy over the full domain -- the quantity the runaway guard caps."""
+        aLy_p = self._backbone_aLy(theta, y_bc, aLy_bc)
         return float(np.max(aLy_p)) if aLy_p.size else 0.0
+
+    def _has_interior_dip(self, aLy_p) -> bool:
+        """True if aLy turns over: it descends and then rises again somewhere on the
+        domain (an interior local MINIMUM).  A monotone rise to an LCFS peak, or a
+        single sub-separatrix peak, is unimodal and fine -- what this rejects is the
+        dip-then-peak shape, which has no pedestal interpretation.  Slopes below 0.1%
+        of the peak are treated as flat so grid noise does not register as a turnover."""
+        aLy_p = np.asarray(aLy_p, dtype=float)
+        if aLy_p.size < 3:
+            return False
+        pk = float(np.max(np.abs(aLy_p)))
+        d = np.diff(aLy_p)
+        sgn = np.sign(d[np.abs(d) > 1e-3 * max(pk, 1e-12)])
+        if sgn.size < 2:
+            return False
+        sgn = sgn[np.insert(np.diff(sgn) != 0, 0, True)]      # collapse flat runs
+        return bool(np.any((sgn[:-1] < 0) & (sgn[1:] > 0)))
+
+    def _peak_cap(self, aLy_k, aLy_bc) -> float:
+        """Cap on the reconstructed aLy peak: kappa * max(aLy at ANY knot, aLy(1)).
+
+        The reference is the largest knot, not the last one: the solver legitimately
+        asks for aLy(0.97) >> aLy_lcfs, and referencing only aLy_k[-1]/aLy_bc would
+        either penalize that or (when the last knot is small) leave the cap far below
+        what the DVs actually demand."""
+        ref = abs(float(aLy_bc))
+        if np.size(aLy_k):
+            ref = max(ref, float(np.max(np.abs(np.asarray(aLy_k, dtype=float)))))
+        return self.fit_peak_kappa * ref
 
     def _lm_solve(self, seed, x_k, aLy_k, y_bc, aLy_bc, scale, lo, hi, peak_cap=None):
         """Bounded Levenberg-Marquardt on the analytic-Jacobian residual. No scipy
@@ -2059,18 +2105,19 @@ class SplineMtanhAnalytic(ParameterBase):
                 best_theta = self._default_theta0(aLy_k, aLy_bc)
             best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
 
-        # Runaway tail-peak guard (detection-gated -> no cost/perturbation on well-behaved
-        # fits). If the fitted backbone overshoots the cap in (0.97,1), do ONE penalized LM
-        # re-fit seeded at the current theta and adopt it only if it actually lowers the
-        # peak. best_r/best_J are recomputed WITHOUT the penalty rows so the UQ covariance
-        # stays the honest data-fit covariance.
+        # Runaway peak guard (detection-gated -> no cost/perturbation on well-behaved
+        # fits). If the fitted backbone overshoots the cap anywhere on [x0,1], do ONE
+        # penalized LM re-fit seeded at the current theta and adopt it only if it actually
+        # lowers the peak. best_r/best_J are recomputed WITHOUT the penalty rows so the UQ
+        # covariance stays the honest data-fit covariance. NB this is accept-if-better, not
+        # accept-if-under-cap, so a converged fit can still sit above the cap -- the UQ
+        # projection in _apply_theta_offset accounts for that.
         if self._peak_penalty_on and aLy_k.size:
-            ref = max(float(aLy_k[-1]), float(aLy_bc))
-            cap = self.fit_peak_kappa * ref
-            if self._tail_peak(best_theta, y_bc, aLy_bc) > cap:
+            cap = self._peak_cap(aLy_k, aLy_bc)
+            if self._profile_peak(best_theta, y_bc, aLy_bc) > cap:
                 th_pen, _, _, _ = self._lm_solve(best_theta, x_k, aLy_k, y_bc, aLy_bc,
                                                  scale, lo, hi, peak_cap=cap)
-                if self._tail_peak(th_pen, y_bc, aLy_bc) < self._tail_peak(best_theta, y_bc, aLy_bc):
+                if self._profile_peak(th_pen, y_bc, aLy_bc) < self._profile_peak(best_theta, y_bc, aLy_bc):
                     best_theta = th_pen
                     best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
 
@@ -2104,18 +2151,71 @@ class SplineMtanhAnalytic(ParameterBase):
     # ------------------------------------------------------------------
     # Resolve (cache + warm start) -> base-class physical tuple
     # ------------------------------------------------------------------
-    def _apply_theta_offset(self, prof, theta):
+    def _apply_theta_offset(self, prof, theta, y_bc=None, aLy_bc=None, aLy_k=None):
         """UQ hook: add a fit-covariance perturbation to theta before reconstruction.
 
         ``_theta_offset[prof]`` is set by the edge-UQ scan to propagate the mtanh
         fit uncertainty through the full chain.  Nominal runs leave it unset (no
         effect).  Operates on the scan's deep-copied parameterizer, so it never
         pollutes the live cache.
+
+        Two conditioners apply to the PERTURBED theta.  Both are needed because every
+        feasibility guarantee this class advertises is enforced inside the FIT (bounds
+        as lo/hi in _lm_solve, peak via the guard in _fit_theta) and the offset is added
+        afterwards -- so an unconditioned UQ sample is reconstructed with all of them off:
+
+        * bounds clip -- w1 back inside _W1_BOUNDS (below 0.01 the tanh foot is a
+          razor-thin spike and aLy runs to ~10x its neighbours), rho below the u'(x)>0
+          feasibility limit (past it the foot turns over, so aLy dips before rising to
+          the peak -- the bimodal samples), s inside (0,1) (keeps m >= 0).
+        * shape projection -- the offset direction comes from a LINEAR profile Jacobian
+          but is applied as a FINITE step through a nonlinear reconstruction, so its
+          amplitude is bisected down until the sample is feasible: peak under _peak_cap
+          AND no turnover (_has_interior_dip).  The direction is preserved and only its
+          magnitude is bounded, so each scan direction stays symmetric about nominal
+          rather than being truncated on one side.  NB the clip alone does NOT prevent
+          the dip-then-peak shape -- it is reachable with all of theta in bounds (c
+          moving within _C_BOUNDS is enough), which is why the dip is a projection
+          condition and not just a consequence of the bounds.
         """
-        off = getattr(self, "_theta_offset", None)
-        if off is not None and off.get(prof) is not None:
-            return np.asarray(theta, dtype=float) + np.asarray(off[prof], dtype=float)
-        return theta
+        theta = np.asarray(theta, dtype=float)
+        offs = getattr(self, "_theta_offset", None)
+        off = None if offs is None else offs.get(prof)
+        if off is None:
+            return theta
+        off = np.asarray(off, dtype=float)
+        lo, hi = self._theta_bounds()
+        th_full = np.clip(theta + off, lo, hi)
+        if not self._peak_penalty_on or y_bc is None or aLy_bc is None:
+            return th_full
+
+        # alpha=0 must be feasible for the bisection to be well posed.  The fit-time
+        # guard is accept-if-better rather than accept-if-under-cap, so the nominal fit
+        # can itself exceed the cap (or, rarely, already dip); the feasibility test is
+        # therefore relaxed to whatever the NOMINAL profile does.  Rule: "a UQ sample is
+        # never worse-peaked or worse-shaped than the cap or the nominal, whichever is
+        # looser" -- it conditions the excursion without re-shaping the nominal.
+        aLy_nom = self._backbone_aLy(theta, y_bc, aLy_bc)
+        cap = max(self._peak_cap(aLy_k, aLy_bc),
+                  float(np.max(aLy_nom)) if aLy_nom.size else 0.0)
+        dip_ok = self._unimodal_proj_on and not self._has_interior_dip(aLy_nom)
+
+        def feasible(th):
+            aLy_p = self._backbone_aLy(th, y_bc, aLy_bc)
+            if aLy_p.size and float(np.max(aLy_p)) > cap:
+                return False
+            return not (dip_ok and self._has_interior_dip(aLy_p))
+
+        if feasible(th_full):
+            return th_full
+        a_lo, a_hi = 0.0, 1.0
+        for _ in range(self.peak_proj_iters):
+            a = 0.5 * (a_lo + a_hi)
+            if feasible(np.clip(theta + a * off, lo, hi)):
+                a_lo = a
+            else:
+                a_hi = a
+        return np.clip(theta + a_lo * off, lo, hi)
 
     def _resolve(self, prof, prof_params):
         bc_y = self.get_nearest_bc(prof, 1.0)
@@ -2139,7 +2239,9 @@ class SplineMtanhAnalytic(ParameterBase):
         # it just gets there in ~1 iteration for the small DV steps a solver takes.
         theta = self._fit_theta(self.knots, vec, y_bc, aLy_bc,
                                 p0=self._last_theta_guess.get(prof))
-        phys = self._theta_to_phys(self._apply_theta_offset(prof, theta), y_bc, aLy_bc)
+        phys = self._theta_to_phys(
+            self._apply_theta_offset(prof, theta, y_bc=y_bc, aLy_bc=aLy_bc, aLy_k=vec),
+            y_bc, aLy_bc)
         if phys is None or not np.all(np.isfinite(np.asarray(phys, dtype=float))):
             return None
 

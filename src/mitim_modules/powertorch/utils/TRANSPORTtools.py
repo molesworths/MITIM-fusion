@@ -439,35 +439,290 @@ from mitim_modules.powertorch.physics_models.transport_cgyro import cgyro_model
 from mitim_modules.powertorch.physics_models.transport_qlgyro import qlgyro_model
 from mitim_modules.powertorch.physics_models.transport_gx import gx_model
 
+# *******************************************************************************************
+# Location-specific model selection
+# *******************************************************************************************
+'''
+turbulence_model / neoclassical_model accept, besides the usual single string
+(same code at every radius), a *per-radius* specification tied to the predicted
+radial locations (predicted_roa / predicted_rho, in that order):
+
+    turbulence_model: "tglf"                                # all radii (legacy)
+    turbulence_model: ["tglf", "tglf", "cgyro", "cgyro"]    # one entry per predicted radius
+    turbulence_model: {0.85: "tglf", 0.95: "cgyro"}         # keyed by r/a (or rho)
+    turbulence_model: {0: "tglf", 3: "cgyro"}               # keyed by radial index
+    turbulence_model: {"default": "tglf", 0.95: "cgyro"}    # partial dict + fallback
+
+Each distinct code is run ONCE over the subset of radii assigned to it (the codes
+are radius-vectorized, so this is the cheapest grouping), on a radially-subset view
+of the powerstate, and the resulting GB fluxes/stds are scattered back into the
+full-length arrays that power_transport expects. When a single code covers every
+radius the legacy path is used verbatim (same folders, same behavior).
+'''
+
+_TURBULENCE_MODELS = {
+    'tglf': tglf_model.evaluate_turbulence,
+    'cgyro': cgyro_model.evaluate_turbulence,
+    'qlgyro': qlgyro_model.evaluate_turbulence,
+    'gx': gx_model.evaluate_turbulence,
+}
+
+_NEOCLASSICAL_MODELS = {
+    'neo': neo_model.evaluate_neoclassical,
+}
+
+_FLUX_VARS_GB = ['QeGB', 'QiGB', 'GeGB', 'GZGB', 'MtGB', 'QieGB']
+
+
+def models_per_radius(spec, n_radii, roa=None, rho=None, kind='transport'):
+    '''
+    Expand a model specification (str, per-radius sequence, or dict keyed by
+    radial index / r-a / rho) into a list of model names, one per radius.
+    '''
+
+    if spec is None:
+        raise Exception(f"[MITIM] No {kind} model specified")
+
+    if isinstance(spec, str):
+        return [spec] * n_radii
+
+    if isinstance(spec, dict):
+        default = spec.get("default", None)
+        models = [default] * n_radii
+
+        for key, value in spec.items():
+            if key == "default":
+                continue
+
+            if isinstance(key, (int, np.integer)) and not isinstance(key, bool):
+                indices = [int(key)]
+                if not (0 <= indices[0] < n_radii):
+                    raise Exception(f"[MITIM] {kind} model index {key} out of range (0-{n_radii-1})")
+            else:
+                # Float key: match against the predicted r/a first, then rho
+                indices = []
+                for coord in (roa, rho):
+                    if coord is None:
+                        continue
+                    indices = [i for i in range(n_radii) if np.isclose(coord[i], float(key), rtol=0.0, atol=1e-6)]
+                    if len(indices) > 0:
+                        break
+                if len(indices) == 0:
+                    raise Exception(
+                        f"[MITIM] {kind} model key {key} does not match any predicted radius "
+                        f"(r/a = {None if roa is None else list(np.round(roa,6))}, "
+                        f"rho = {None if rho is None else list(np.round(rho,6))})")
+
+            for i in indices:
+                models[i] = value
+
+        if any(m is None for m in models):
+            missing = [i for i, m in enumerate(models) if m is None]
+            raise Exception(
+                f"[MITIM] {kind} model not defined at radial position(s) {missing}. "
+                "Provide them explicitly or add a 'default' key")
+
+        return models
+
+    # Sequence (list, tuple, array)
+    models = list(spec)
+    if len(models) != n_radii:
+        raise Exception(f"[MITIM] {kind} model list has {len(models)} entries but there are {n_radii} predicted radii")
+
+    return models
+
+
+def unique_models(spec):
+    '''
+    Set of model names in a (possibly per-radius) model specification. Useful for
+    downstream checks that require a specific code at all radii.
+    '''
+
+    if spec is None:
+        return set()
+    if isinstance(spec, str):
+        return {spec}
+    if isinstance(spec, dict):
+        return {v for v in spec.values() if v is not None}
+    return {m for m in spec if m is not None}
+
+
+def _subset_plasma_radially(plasma, indices, n_radii):
+    '''
+    Radially-subset view of a transport-facing plasma dict. Tensors whose radial
+    dimension (dim 1) is n_radii+1 keep their axis-padding entry (index 0); those
+    of length n_radii are subset directly. Everything else passes through.
+    '''
+
+    idx_pad = [0] + [i + 1 for i in indices]
+    idx = list(indices)
+
+    out = {}
+    for key, val in plasma.items():
+        if isinstance(val, torch.Tensor) and val.dim() >= 2 and val.shape[1] in (n_radii, n_radii + 1):
+            selection = idx_pad if val.shape[1] == n_radii + 1 else idx
+            out[key] = val.index_select(1, torch.as_tensor(selection, device=val.device))
+        elif isinstance(val, np.ndarray) and val.ndim >= 2 and val.shape[1] in (n_radii, n_radii + 1):
+            selection = idx_pad if val.shape[1] == n_radii + 1 else idx
+            out[key] = np.take(val, selection, axis=1)
+        else:
+            out[key] = val
+
+    return out
+
+
+class multi_model_results:
+    '''
+    Aggregate of the per-code model objects produced by a location-specific run.
+    Exposes a merged ``inputs_files`` (keyed by rho, as each code does) so that
+    downstream consumers that look up decks by radius (e.g. EvaluationArchive)
+    see the full radial set.
+    '''
+
+    def __init__(self, results_by_model, models_per_radius):
+        self.results_by_model = results_by_model
+        self.models_per_radius = models_per_radius
+
+        self.inputs_files = {}
+        for model_object in results_by_model.values():
+            inputs_files = getattr(model_object, "inputs_files", None)
+            if isinstance(inputs_files, dict):
+                self.inputs_files.update(inputs_files)
+
+
 class portals_transport_model(power_transport, tglf_model, neo_model, cgyro_model, qlgyro_model, gx_model):
 
     def __init__(self, powerstate, **kwargs):
         super().__init__(powerstate, **kwargs)
 
-        # Defaults
+        # Defaults (a string applies to all radii; see models_per_radius for per-location specs)
         self.turbulence_model = 'tglf'
         self.neoclassical_model = 'neo'
 
     def produce_profiles(self):
         self._produce_profiles()
-        
+
     @IOtools.hook_method(after=partial(write_json, file_name = 'fluxes_turb.json', suffix= 'turb'))
     def evaluate_turbulence(self):
-        
-        if self.turbulence_model == 'tglf':
-            return tglf_model.evaluate_turbulence(self)
-        elif self.turbulence_model == 'cgyro':
-            return cgyro_model.evaluate_turbulence(self)
-        elif self.turbulence_model == 'qlgyro':
-            return qlgyro_model.evaluate_turbulence(self)
-        elif self.turbulence_model == 'gx':
-            return gx_model.evaluate_turbulence(self)
-        else:
-            raise Exception(f"Unknown turbulence model {self.turbulence_model}")
+        return self._evaluate_by_location(self.turbulence_model, _TURBULENCE_MODELS, 'turb', 'turbulence')
 
     @IOtools.hook_method(after=partial(write_json, file_name = 'fluxes_neoc.json', suffix= 'neoc'))
     def evaluate_neoclassical(self):
-        if self.neoclassical_model == 'neo':
-            return neo_model.evaluate_neoclassical(self)
-        else:
-            raise Exception(f"Unknown neoclassical model {self.neoclassical_model}")
+        return self._evaluate_by_location(self.neoclassical_model, _NEOCLASSICAL_MODELS, 'neoc', 'neoclassical')
+
+    # ----------------------------------------------------------------------------------------------------
+    # Location-specific dispatch
+    # ----------------------------------------------------------------------------------------------------
+
+    def _evaluate_by_location(self, spec, registry, suffix, kind):
+
+        n_radii = self.powerstate.plasma["rho"].shape[-1] - 1
+
+        def _coord(key):
+            if key not in self.powerstate.plasma:
+                return None
+            return self.powerstate.plasma[key][0, 1:].detach().cpu().numpy()
+
+        models = models_per_radius(spec, n_radii, roa=_coord("roa"), rho=_coord("rho"), kind=kind)
+
+        for model in models:
+            if model not in registry:
+                raise Exception(f"Unknown {kind} model {model}")
+
+        models_unique = list(dict.fromkeys(models))
+
+        # Single code everywhere: legacy path, untouched (same folders and naming)
+        if len(models_unique) == 1:
+            return registry[models_unique[0]](self)
+
+        print(f"\t- Location-specific {kind} models: " +
+              ", ".join([f"#{i} ({models[i]})" for i in range(n_radii)]), typeMsg="i")
+
+        results_by_model = {}
+        model_results = {}
+        for model in models_unique:
+
+            indices = [i for i in range(n_radii) if models[i] == model]
+
+            sub = self._radial_subset_evaluator(indices, model, suffix, n_radii)
+            results_by_model[model] = registry[model](sub)
+
+            self._gather_from_subset(sub, indices, suffix)
+
+            if getattr(sub, "model_results", None) is not None:
+                model_results[model] = sub.model_results
+
+        if len(model_results) > 0:
+            self.model_results = model_results
+
+        return multi_model_results(results_by_model, models)
+
+    def _radial_subset_evaluator(self, indices, model, suffix, n_radii):
+        '''
+        Shallow clone of this evaluator that sees only ``indices`` of the radial grid,
+        with its own folder so that the codes' subfolders never collide.
+        '''
+
+        sub = copy.copy(self)
+
+        sub.powerstate = copy.copy(self.powerstate)
+        sub.powerstate.plasma = _subset_plasma_radially(self.powerstate.plasma, indices, n_radii)
+
+        # Codes mutate their shared options dict (QLGYRO and CGYRO force the tglf block's
+        # use_scan_trick_for_stds=None for their internal base-TGLF run). Give each group its
+        # own copy, so that one code cannot silently change the settings another group runs
+        # with depending on the order the groups happen to be evaluated in.
+        try:
+            sub.transport_evaluator_options = copy.deepcopy(self.transport_evaluator_options)
+        except Exception as e:
+            print(f"\t- Could not isolate the {model} transport options ({e}), sharing them", typeMsg="w")
+
+        sub.folder = self.folder / model
+        sub.folder.mkdir(parents=True, exist_ok=True)
+        sub.name = f"{self.name}_{model}"
+
+        # Flux containers at the subset length (the codes overwrite them, but keep shapes consistent)
+        for var in _FLUX_VARS_GB:
+            for suffix0 in ['', '_stds']:
+                sub.__dict__[f"{var}_{suffix}{suffix0}"] = np.zeros(len(indices))
+
+        return sub
+
+    def _gather_from_subset(self, sub, indices, suffix):
+        '''
+        Scatter the subset GB fluxes/stds back into this evaluator's full-length arrays.
+        '''
+
+        for var in _FLUX_VARS_GB:
+            for suffix0 in ['', '_stds']:
+                key = f"{var}_{suffix}{suffix0}"
+
+                values = sub.__dict__.get(key, None)
+                if values is None:
+                    continue
+                values = np.asarray(_to_numpy(values), dtype=float).reshape(-1)
+
+                if values.shape[0] != len(indices):
+                    raise Exception(
+                        f"[MITIM] {sub.name} returned {values.shape[0]} value(s) for '{key}' "
+                        f"but was run at {len(indices)} radial location(s)")
+
+                full = np.asarray(_to_numpy(self.__dict__[key]), dtype=float).reshape(-1)
+                full[indices] = values
+                self.__dict__[key] = full
+
+        # A code may ask that the json is provided externally instead of written from its
+        # variables (gyrokinetic run_type='prep'). Then the json IS the source of truth and
+        # is read back by _populate_from_json from the PARENT folder, whereas this sub-model
+        # waits for one in its own folder covering only its own radii -- so the fluxes at the
+        # other radii would be silently lost. Not supported per-location.
+        for flag in ['_write_json_from_variables_turb', '_write_json_from_variables_neoc']:
+            if not getattr(sub, flag, True):
+                raise NotImplementedError(
+                    "[MITIM] Externally-provided fluxes (gyrokinetic run_type='prep') are not "
+                    "supported with location-specific transport models, because the json is "
+                    "read back for the full radial grid. Run that code at all radii instead")
+
+
+def _to_numpy(value):
+    return value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value)
