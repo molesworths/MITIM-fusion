@@ -1530,17 +1530,24 @@ class SplineMtanhAnalytic(ParameterBase):
         self.x0 = float(options.get('x0', 0.85))
         # TRF fit controls (analytic Jacobian; deterministic fixed-seed sweep, no cache).
         self.fit_max_nfev = int(options.get('fit_max_nfev', 100))
-        self.fit_trf_ftol = float(options.get('fit_trf_ftol', 1e-3))
+        self.fit_trf_ftol = float(options.get('fit_trf_ftol', 1e-4))
         self.fit_trf_gtol = float(options.get('fit_trf_gtol', 1e-12))
-        self.fit_trf_xtol = float(options.get('fit_trf_xtol', 1e-3))
+        self.fit_trf_xtol = float(options.get('fit_trf_xtol', 1e-4))
         self.fit_max_rel_error = float(options.get('fit_max_rel_error', 2e-2))
-        self.fit_warm_accept_rel = float(options.get('fit_warm_accept_rel', 0.30))
+        # Multistart / escalation controls (see _seed_bank, _fit_theta).
+        self.fit_seeds = int(options.get('fit_seeds', 2))
+        # Polish ALWAYS (rel<0 disables the gate). Gating it on knot error let one
+        # case in 28 skip the polish and land 38% off in PROFILE terms -- knot error
+        # is not a proxy for aLy(r) accuracy. Tolerances are set by the delivered
+        # profile: xtol/ftol 1e-3 left 5/28 cases >1% from a converged fit; 1e-4 with
+        # nfev 40 holds every case to 0.12% for ~2 ms more.
+        self.fit_polish_rel = float(options.get('fit_polish_rel', -1.0))
+        self.fit_polish_nfev = int(options.get('fit_polish_nfev', 40))
         # Hand-rolled LM fit controls (replaces scipy least_squares for O(1 ms) fits).
         self.fit_lm_iters = int(options.get('fit_lm_iters', 12))
         self.fit_lm_damping_tries = int(options.get('fit_lm_damping_tries', 4))
         self.fit_lm_ctol = float(options.get('fit_lm_ctol', 1e-3))   # rel-cost stop
         self.fit_lm_gtol = float(options.get('fit_lm_gtol', 1e-4))   # KKT-grad stop
-        self.fit_ridge_cost = float(options.get('fit_ridge_cost', 0.05))
         # Per-profile previous fit, reused as a warm-start seed (speed only; the fit
         # still runs to convergence so the result stays deterministic).
         self._last_theta_guess: Dict[str, np.ndarray] = {}
@@ -1548,6 +1555,12 @@ class SplineMtanhAnalytic(ParameterBase):
         self.n_params_per_profile = len(self.param_names)
         # --- analytic-fit specifics ---
         self.lam_r = float(options.get('lam_r', 0.3))
+        # Target the lam_r prior pulls rho toward (see _rho_target): 0 when the knots
+        # imply a monotone foot, rho_target_hi when they imply a sub-separatrix peak,
+        # smoothstepped over rho_target_ramp of relative overshoot so the fit stays
+        # continuous in the DVs. rho_target_hi=0 restores the old "always flat" prior.
+        self.rho_target_hi = float(options.get('rho_target_hi', 0.999))
+        self.rho_target_ramp = float(options.get('rho_target_ramp', 0.25))
         # c-seed sigmoid in R = aLy1/aLy(x_last):
         #   c(R) = c_lo + (c_hi-c_lo) * R^p / (R^p + a),  a chosen so c(1)=c_mid.
         # Defaults recalibrated against a 3-knot pedestal/shortfall benchmark:
@@ -1564,18 +1577,23 @@ class SplineMtanhAnalytic(ParameterBase):
         # guaranteed to hit the requested aLy knots (up to ~10-18% off on non-mtanh
         # interior shapes), so Delta(x) pins them exactly. Set use_corrector=False to
         # report the BARE mtanh backbone (knots then only approximately matched via the
-        # fit theta) -- the tail-peak guard + w1 bound still apply to the backbone, so
+        # fit theta) -- the peak guard + w1 bound still apply to the backbone, so
         # the reported profile stays physical. NB with the corrector off the aLy-knot
         # DVs enter only through the (detached) fit, so the straight-through torch DV
         # gradient vanishes (the solver's FD-through-parameterizer path is unaffected).
         self.use_corrector = bool(options.get('use_corrector', True))
+        # Corrector support (see _corrector_anchors): the residual correction tapers to
+        # zero a fraction `corrector_taper` of the way from the outermost knots to the
+        # domain edges, so the near-LCFS foot is backbone-only. taper=1 restores the
+        # previous behaviour (correction active over the whole domain).
+        self.corrector_taper = float(options.get('corrector_taper', 0.5))
         # Fixed defaults for the non-c solver components.
         self.s0 = float(options.get('s0', 0.5))
         self.w1_0 = float(options.get('w1_0', 0.02))
         # Runaway peak guard. A flat interior with a steep last-knot/LCFS jump can make
         # the mtanh backbone overshoot to many x its neighbours (e.g. aLne ~100 with knots
         # ~20) even at the physical w1 floor. When the fitted backbone peak exceeds
-        # fit_peak_kappa * max(aLy(knots), aLy(1)) (see _peak_cap), a single penalized LM
+        # the per-interval cap (see _peak_cap_profile), a single penalized LM
         # re-fit (soft ReLU on the excess at _peak_x) pulls it back under the cap. Gated on
         # detection -> real, non-runaway fits never re-fit (byte-identical) and pay only one
         # cheap peak evaluation. The corrector still pins the interior knots, so the re-fit
@@ -1588,6 +1606,16 @@ class SplineMtanhAnalytic(ParameterBase):
         self.fit_peak_kappa = float(options.get('fit_peak_kappa', 2.0))
         self.fit_peak_weight = float(options.get('fit_peak_weight', 5.0))
         self.peak_proj_iters = int(options.get('fit_peak_proj_iters', 12))
+        # Slope-extrapolation shape rule (see _peak_cap_profile): decides per knot
+        # interval whether a local aLy max between the knots is expected at all, so a
+        # genuine sub-separatrix peak stays legal while an unsupported overshoot of a
+        # hard LCFS BC does not. Independent of knot placement.
+        self._peak_extrap_on = bool(options.get('fit_peak_extrap', True))
+        # 0.5% slack: enough that a converged, well-behaved fit never trips a re-fit,
+        # small enough that the reconstruction stays visually monotone when the knots
+        # say it should be (measured: overshoot tracks this tolerance almost exactly,
+        # at no cost in knot-match error).
+        self.fit_peak_tol = float(options.get('fit_peak_tol', 0.005))
         # Also reject the dip-then-peak (turnover) shape when projecting a UQ theta
         # offset. Applies to the perturbation only -- a nominal fit that already dips is
         # left alone (see _apply_theta_offset).
@@ -1733,25 +1761,60 @@ class SplineMtanhAnalytic(ParameterBase):
     #  C1. The knots are sparse and the residual is small on a good fit, so the tail
     #  the solver integrates is unaffected.)
     # ------------------------------------------------------------------
+    def _corrector_anchors(self):
+        """Abscissae for the knot-residual corrector, and the index of the first knot.
+
+        ``[0, x_l, knots..., x_r, 1]`` with the residual pinned to 0 at all four outer
+        anchors.  The corrector's job is to pin aLy at the predicted_roa knots, so its
+        support is confined to a neighbourhood of that span: it is identically zero
+        outside ``(x_l, x_r)``, leaving the mtanh backbone solely responsible for the
+        near-LCFS foot -- the region that carries the hard aLy(1) BC and the
+        sub-separatrix peak, and where the knots say nothing.
+
+        Two zero anchors per side (rather than one) is what makes that C1 rather than
+        merely C0: pchip sets the node derivative to zero where consecutive slopes have
+        a zero product, so the flat 0-to-0 outer segment forces zero slope at x_l/x_r
+        and the correction joins the backbone smoothly instead of with a kink (which
+        would show up in get_curvature).
+
+        ``corrector_taper`` places x_l/x_r as a fraction of the gap from the outermost
+        knots to the domain edges; taper=1 puts them at the edges, recovering the
+        previous full-domain corrector."""
+        knots = np.asarray(self.knots, dtype=float)
+        tau = float(np.clip(self.corrector_taper, 0.0, 1.0))
+        x_l = knots[0] - tau * (knots[0] - self.x0)
+        x_r = knots[-1] + tau * (1.0 - knots[-1])
+        xs = np.concatenate(([0.0, x_l], knots, [x_r, 1.0]))
+        return xs, 2
+
     def _corrector_ops(self, x):
         x = np.asarray(x, dtype=float)
         knots = np.asarray(self.knots, dtype=float)
         n = knots.size
         cache = self.__dict__.setdefault("_corr_cache", {})
-        ck = (n, x.size, float(x[0]), float(x[-1]))
+        ck = (n, x.size, float(x[0]), float(x[-1]), float(self.corrector_taper))
         hit = cache.get(ck)
         if hit is not None and hit[0].shape == (x.size, n):
             return hit
-        xs = np.concatenate(([0.0], knots, [1.0]))          # abscissae, resid pinned 0 at 0,1
+        xs, k0 = self._corrector_anchors()
         seg = np.clip(np.searchsorted(xs, x, side="right") - 1, 0, xs.size - 2)
-        t = (x - xs[seg]) / (xs[seg + 1] - xs[seg])          # local coord in each segment
+        # taper=1 puts the outer anchor exactly on the domain edge, collapsing the last
+        # segment to zero width; guard the division (such a segment carries resid 0 at
+        # both ends, so a 0 contribution there is the correct answer, not an omission).
+        w = xs[seg + 1] - xs[seg]
+        t = np.where(w > 0, (x - xs[seg]) / np.where(w > 0, w, 1.0), 0.0)
         B = np.zeros((x.size, n)); Bp = np.zeros((x.size, n))
         for i in range(n):
-            j = i + 1                                        # knot i sits at xs[j]
+            j = i + k0                                       # knot i sits at xs[j]
             left = seg == (j - 1); right = seg == j          # segments touching this knot
             B[left, i] = t[left]; B[right, i] = 1.0 - t[right]
-            Bp[left, i] = 1.0 / (xs[j] - xs[j - 1])
-            Bp[right, i] = -1.0 / (xs[j + 1] - xs[j])
+            wl, wr = xs[j] - xs[j - 1], xs[j + 1] - xs[j]
+            Bp[left, i] = 1.0 / wl if wl > 0 else 0.0
+            Bp[right, i] = -1.0 / wr if wr > 0 else 0.0
+        # Zero outside the corrector's support: searchsorted clamps out-of-range x into
+        # the end segments, which would otherwise extrapolate the hat functions.
+        out = (x < xs[k0 - 1]) | (x > xs[k0 + n])
+        B[out, :] = 0.0; Bp[out, :] = 0.0
         cache[ck] = (B, Bp)
         return B, Bp
 
@@ -1806,14 +1869,17 @@ class SplineMtanhAnalytic(ParameterBase):
             # non-monotone vs pchip's ~14). pchip is both smooth (C1) and robust. The
             # torch AUTOGRAD path instead uses the constant LINEAR operator
             # (_corrector_ops) for differentiability, decoupled here via straight-through.
-            knots = np.asarray(self.knots, dtype=float)
-            xs = np.concatenate(([0.0], knots, [1.0]))
-            ds = np.concatenate(([0.0], resid, [0.0]))
+            xs, k0 = self._corrector_anchors()
+            ds = np.concatenate(([0.0, 0.0], resid, [0.0, 0.0]))
             xs, idx = np.unique(xs, return_index=True)
             ds = ds[idx]
             corr = pchip(xs, ds, extrapolate=True)
             delta_aLy = corr(x)
             ddelta_aLy = corr.derivative()(x)
+            # Hard-zero outside the corrector support (pchip would extrapolate).
+            out = (x < xs[0]) | (x > xs[-1])
+            delta_aLy = np.where(out, 0.0, delta_aLy)
+            ddelta_aLy = np.where(out, 0.0, ddelta_aLy)
             cum = cumulative_trapezoid(delta_aLy, x, initial=0.0)
             phase = np.clip(cum[-1] - cum, -10.0, 10.0)   # int_x^1 Delta dx'
             efac = np.exp(phase)
@@ -1939,22 +2005,33 @@ class SplineMtanhAnalytic(ParameterBase):
         # rho moves r alone. Columns are [s, c, w1, rho].
         J = np.stack([d_s, d_c + d_r * dr_dc, d_w1, d_r * dr_drho], axis=-1) / scale[:, None]
         if self.lam_r > 0:
-            # Regularize the (bounded) foot fraction rho toward 0; keeps the fit unique
-            # when #knots<4 and is neutral on peaking once the knots demand it.
-            res = np.concatenate([res, [self.lam_r * rho]])
+            # Regularize the (bounded) foot fraction rho toward 0. This is a UNIQUENESS
+            # term, not a shape prior: with lam_r=0 the fitted rho is seed-dependent
+            # across nearly its whole [0, 0.999] range (measured ptp(rho) 0.999 at 3 and
+            # 4 knots, 0.76 at 2), so the backbone shape stops being a pure function of
+            # the DVs. lam_r=0.3 collapses that to ptp ~0.02-0.03 at 2-3 knots and ~0.66
+            # at 4. NB the target is _rho_target, NOT 0: pulling toward 0 unconditionally
+            # made this a "no peak" shape prior that suppressed real sub-separatrix peaks
+            # (it parked rho at 0.05 on a foot whose knot-fit error fell monotonically
+            # from 0.079 to 0.050 as rho -> 1). Uniqueness comes from the prior's
+            # STRENGTH; the shape must come from the knots.
+            res = np.concatenate([res, [self.lam_r * (rho - self._rho_target(aLy_k, aLy_bc))]])
             J = np.concatenate([J, [[0.0, 0.0, 0.0, self.lam_r]]], axis=0)
         if peak_cap is not None:
-            # Runaway-tail penalty (only threaded in on the spike-guard re-fit): a
-            # one-sided ReLU on the fractional overshoot of aLy above peak_cap at the
-            # tail sample points. Rows are 0 (and drop out of J^TJ) wherever the backbone
-            # is already under the cap, so the penalty only pulls down an over-peaked foot.
+            # Peak penalty (only threaded in on the guard re-fit): a one-sided ReLU on
+            # the fractional overshoot of aLy above peak_cap at the sample points. Rows
+            # are 0 (and drop out of J^TJ) wherever the backbone is already under the
+            # cap, so the penalty only pulls down an over-peaked region. peak_cap is a
+            # PER-SAMPLE array (the knot-interval shape rule), hence the [:, None].
             with np.errstate(over="ignore", invalid="ignore"):
                 _, aLy_p, ds_p, dc_p, dw_p, dr_p = _pedestal_eval_all(
                     self._peak_x, s, c, w1, r, self.x0, y_bc, aLy_bc)
-            excess = (aLy_p - peak_cap) / peak_cap
+            pcap = np.maximum(np.broadcast_to(
+                np.asarray(peak_cap, dtype=float), aLy_p.shape), 1e-12)
+            excess = (aLy_p - pcap) / pcap
             active = excess > 0.0
             pen = self.fit_peak_weight * np.where(active, excess, 0.0)
-            Jp = (self.fit_peak_weight / peak_cap) * np.stack(
+            Jp = (self.fit_peak_weight / pcap)[:, None] * np.stack(
                 [ds_p, dc_p + dr_p * dr_dc, dw_p, dr_p * dr_drho], axis=-1)
             Jp[~active] = 0.0
             res = np.concatenate([res, pen])
@@ -1970,18 +2047,31 @@ class SplineMtanhAnalytic(ParameterBase):
         return float(np.max(rel)) if rel.size else np.inf
 
     def _backbone_aLy(self, theta, y_bc, aLy_bc) -> np.ndarray:
-        """Backbone aLy on the full-domain guard grid. Cheap (one _pedestal_eval_all
-        on ~64 points); the shared primitive behind the peak and dip diagnostics."""
-        s, c, w1, rho = (float(v) for v in theta)
-        r, _, _ = self._rho_c_to_r(rho, c)
-        with np.errstate(over="ignore", invalid="ignore"):
-            _, aLy_p, *_ = _pedestal_eval_all(self._peak_x, s, c, w1, r, self.x0, y_bc, aLy_bc)
+        """Backbone aLy on the full-domain guard grid; the shared primitive behind the
+        peak and dip diagnostics.
+
+        Deliberately NOT _pedestal_eval_all: that also builds the four d(aLy)/dtheta
+        arrays, which the guard never uses, and this sits in the warm-fit hot path
+        (every _fit_theta calls it at least once). Going through the value-only
+        _y_mtanh/_dydx_mtanh instead is ~4x cheaper for an identical result."""
+        phys = self._theta_to_phys(np.asarray(theta, dtype=float), y_bc, aLy_bc)
+        if phys is None:
+            return np.zeros(0, dtype=float)
+        g, D0, delta, m, c, _ = phys
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            y = self._y_mtanh(self._peak_x, g, D0, delta, m, c, y_bc)
+            dy = self._dydx_mtanh(self._peak_x, g, D0, delta, m, c)
+            aLy_p = -dy / np.where(np.abs(y) < self._Y_FLOOR, self._Y_FLOOR, y)
         return np.nan_to_num(np.asarray(aLy_p, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
 
-    def _profile_peak(self, theta, y_bc, aLy_bc) -> float:
-        """Max backbone aLy over the full domain -- the quantity the runaway guard caps."""
+    def _peak_excess(self, theta, y_bc, aLy_bc, cap) -> float:
+        """Worst violation of the per-sample cap, as a ratio (<=1 means feasible).
+        Ratio rather than difference so the guard weights a 10% overshoot of a small
+        cap the same as a 10% overshoot of a large one."""
         aLy_p = self._backbone_aLy(theta, y_bc, aLy_bc)
-        return float(np.max(aLy_p)) if aLy_p.size else 0.0
+        if not aLy_p.size:
+            return 0.0
+        return float(np.max(aLy_p / np.maximum(np.asarray(cap, dtype=float), 1e-12)))
 
     def _has_interior_dip(self, aLy_p) -> bool:
         """True if aLy turns over: it descends and then rises again somewhere on the
@@ -2000,17 +2090,117 @@ class SplineMtanhAnalytic(ParameterBase):
         sgn = sgn[np.insert(np.diff(sgn) != 0, 0, True)]      # collapse flat runs
         return bool(np.any((sgn[:-1] < 0) & (sgn[1:] > 0)))
 
-    def _peak_cap(self, aLy_k, aLy_bc) -> float:
-        """Cap on the reconstructed aLy peak: kappa * max(aLy at ANY knot, aLy(1)).
+    def _rho_target(self, aLy_k, aLy_bc) -> float:
+        """Foot-asymmetry target the lam_r prior pulls toward, set by the SAME
+        slope-extrapolation rule that sets the peak cap (see _peak_cap_profile).
 
-        The reference is the largest knot, not the last one: the solver legitimately
-        asks for aLy(0.97) >> aLy_lcfs, and referencing only aLy_k[-1]/aLy_bc would
-        either penalize that or (when the last knot is small) leave the cap far below
-        what the DVs actually demand."""
-        ref = abs(float(aLy_bc))
-        if np.size(aLy_k):
-            ref = max(ref, float(np.max(np.abs(np.asarray(aLy_k, dtype=float)))))
-        return self.fit_peak_kappa * ref
+        rho is the peaking knob: rho=0 is the flat non-peaking edge, rho->1 the
+        steepest feasible foot (sub-separatrix aLy peak).  Regularizing it toward 0
+        unconditionally -- as this did originally -- is a *shape* prior for "no peak",
+        and it wins whenever rho is weakly identified.  That silently suppressed real
+        peaks: on a foot whose knots demand one, the knot-fit error falls monotonically
+        with rho (0.079 -> 0.050) and lam_r=0.3 still parked rho at 0.05, reporting a
+        monotone profile.  Pointing the same prior at the geometry-implied target keeps
+        the uniqueness it was introduced for while letting the knots choose the shape.
+
+        Ramped, not switched: a hard 0/RHO_HI flip at E = aLy(1) would make the fitted
+        rho -- and hence the reported profile -- discontinuous in the DVs as knots cross
+        the threshold.  The ramp is in the RELATIVE overshoot (E - aLy(1))/|aLy(1)|."""
+        ak = np.asarray(aLy_k, dtype=float).reshape(-1)
+        xk = np.asarray(self.knots, dtype=float)
+        if ak.size < 2 or xk.size < 2 or xk.size != ak.size:
+            return 0.0
+        # Memoized: _resid_jac calls this on EVERY residual evaluation (the innermost
+        # LM loop) while it depends only on the knot DVs and the BC, which are fixed
+        # for the duration of a fit. Recomputing it there is pure overhead.
+        key = (ak.tobytes(), float(aLy_bc))
+        cache = self.__dict__.setdefault("_rho_target_cache", {})
+        hit = cache.get(key)
+        if hit is not None:
+            return hit
+        dx = xk[-1] - xk[-2]
+        if abs(dx) < 1e-12:
+            return 0.0
+        E = ak[-1] + (ak[-1] - ak[-2]) / dx * (1.0 - xk[-1])
+        denom = max(abs(float(aLy_bc)), 1e-9)
+        t = (E - float(aLy_bc)) / denom
+        ramp = float(np.clip(t / max(self.rho_target_ramp, 1e-9), 0.0, 1.0))
+        out = self.rho_target_hi * ramp * ramp * (3.0 - 2.0 * ramp)    # smoothstep
+        if len(cache) > 512:
+            cache.clear()
+        cache[key] = out
+        return out
+
+    def _peak_cap_profile(self, aLy_k, aLy_bc) -> np.ndarray:
+        """Per-sample cap on the reconstructed aLy, evaluated on ``_peak_x``.
+
+        Two rules, both of which must hold (elementwise min):
+
+        1. SLOPE-EXTRAPOLATION (the shape rule).  On each knot interval
+           [x_i, x_{i+1}] -- the knot list INCLUDING the LCFS knot (1, aLy_bc) --
+           extrapolate the incoming trend one interval forward,
+
+               E_{i+1} = aLy_i + slope_i * (x_{i+1} - x_i),
+               slope_i = (aLy_i - aLy_{i-1}) / (x_i - x_{i-1}),
+
+           and allow ``max(aLy_i, aLy_{i+1}, E_{i+1})``.  The logic: if the incoming
+           trend overshoots the next knot (E > aLy_{i+1}) the profile must bend back
+           down, so a local max between the knots is REAL and is allowed up to where
+           that trend would have taken it.  If the trend undershoots (E < aLy_{i+1},
+           i.e. the profile is still accelerating -- the ordinary pedestal foot) then
+           nothing about the data supports a peak there, and the interval is capped at
+           its endpoints.  No free parameter, and no assumption about knot placement:
+           it reads the peak expectation off the knot geometry the solver hands us.
+
+           This is what the earlier fixed references could not do.  With aLy(0.97)=5
+           and a hard aLy(1)=108, a ``kappa*max(knots, aLy_lcfs)`` cap sits at 216 and
+           a ~114 overshoot at roa~0.997 sails through, even though the knots say the
+           foot is still accelerating and must rise monotonically to the BC.
+
+        2. RUNAWAY (the magnitude rule): ``fit_peak_kappa * max(|aLy_k|, |aLy_bc|)``,
+           the original order-of-magnitude backstop, kept so a steep interval cannot
+           license an arbitrarily tall extrapolated peak.
+
+        ``fit_peak_tol`` adds a small relative slack so numerical noise in a converged
+        fit does not trip the guard."""
+        x = np.asarray(self._peak_x, dtype=float)
+        aLy_bc = float(aLy_bc)
+        aLy_k = np.asarray(aLy_k, dtype=float).reshape(-1)
+
+        ref = abs(aLy_bc)
+        if aLy_k.size:
+            ref = max(ref, float(np.max(np.abs(aLy_k))))
+        cap = np.full(x.size, self.fit_peak_kappa * ref, dtype=float)
+        if not (self._peak_extrap_on and aLy_k.size):
+            return cap
+
+        xk = np.concatenate([np.asarray(self.knots, dtype=float), [1.0]])
+        ak = np.concatenate([aLy_k[:np.size(self.knots)], [aLy_bc]])
+        if xk.size != ak.size or xk.size < 2:
+            return cap
+
+        # Vectorized: per-interval caps, then a searchsorted bucket per sample. This is
+        # called once per _fit_theta (warm hot path), so the old Python loop over
+        # intervals with a boolean mask per interval was worth removing.
+        dx = np.diff(xk[:-1])                             # spacing into knot i, i>=1
+        slope = np.where(np.abs(dx) > 1e-12, np.diff(ak[:-1]) / np.where(dx == 0, 1, dx), 0.0)
+        E = np.empty(xk.size - 1, dtype=float)
+        E[0] = ak[1]                                      # no incoming slope at the first
+        E[1:] = ak[1:-1] + slope * np.diff(xk)[1:]
+        seg_cap = np.maximum(np.maximum(ak[:-1], ak[1:]), E)
+        # bucket each sample into its interval; everything left of the first knot uses
+        # interval 0, everything right of the last knot uses the final interval
+        idx = np.clip(np.searchsorted(xk, x, side="right") - 1, 0, seg_cap.size - 1)
+        # The shape rule applies ONLY beyond the last knot. Between knots it compared the
+        # backbone against DV values the backbone does not interpolate (it carries ~15%
+        # knot error by construction -- the corrector is what pins the DVs), so a
+        # perfectly monotone backbone sitting a few % above a DV read as a violation and
+        # bought a wasted penalized re-fit on 11/27 fits. Nothing is lost by dropping it:
+        # the analytic form is unimodal by construction (measured: 0/28 fits have a second
+        # maximum or any interior minimum), so between knots there is no shape to police.
+        # The kappa runaway bound still covers the whole domain as a magnitude backstop.
+        shape = np.where(x > xk[-2] - 1e-12, seg_cap[idx] * (1.0 + self.fit_peak_tol), np.inf)
+        return np.minimum(cap, shape)
 
     def _lm_solve(self, seed, x_k, aLy_k, y_bc, aLy_bc, scale, lo, hi, peak_cap=None):
         """Bounded Levenberg-Marquardt on the analytic-Jacobian residual. No scipy
@@ -2062,48 +2252,94 @@ class SplineMtanhAnalytic(ParameterBase):
                 break
         return theta, cost, r, J          # r, J correspond to the returned theta
 
+    def _seed_bank(self, aLy_k, aLy_bc):
+        """Fixed multistart seeds, ordered most-likely-best first so the early exit
+        usually pays for one or two LM solves.
+
+        theta = [s, c, w1, rho].  s splits the LCFS gradient between the tanh amplitude
+        A = s*y1*aLy1 and the linear background m = (1-s)*y1*aLy1, so s = A/(A+m);
+        c is the pedestal centre, w1 the foot width, rho the width asymmetry
+        (0 = symmetric, ->1 = steep sub-separatrix foot).
+
+        Three shapes span the range of edges this has to fit:
+          1. data-driven: c seeded from the aLy(1)/aLy(x_last) ratio, foot asymmetry
+             from the peaking heuristic;
+          2. pedestal: A=1, m=0.1 (s=1/1.1), c=0.97, w1=0.02, symmetric;
+          3. no pedestal: minimum A, maximum c, linear background dominant (m=1),
+             symmetric -- the flat, non-peaking edge.
+        Seed 1 carries the peaking heuristic so a peaked foot is reachable from the
+        start rather than only via the lam_r prior."""
+        lo, hi = self._theta_bounds()
+        rho_t = self._rho_target(aLy_k, aLy_bc)
+        s_ped = 1.0 / 1.1                      # A=1, m=0.1
+        base = np.asarray(self._default_theta0(aLy_k, aLy_bc), dtype=float)
+        seed1 = base.copy(); seed1[3] = rho_t
+        seeds = [seed1,
+                 np.array([s_ped, 0.97, 0.02, rho_t], dtype=float),
+                 np.array([s_ped, 0.97, 0.02, 0.0], dtype=float),
+                 np.array([lo[0], hi[1], self.w1_0, 0.0], dtype=float)]
+        # Measured: the TRF polish reaches the same minimum from any of these, so seeds
+        # past the first two buy nothing (identical med/max knot error) and cost ~5 ms.
+        return [np.clip(s, lo, hi) for s in seeds[:max(1, self.fit_seeds)]]
+
     def _fit_theta(self, x_k, aLy_k, y_bc, aLy_bc, p0=None) -> np.ndarray:
         x_k = np.asarray(x_k, dtype=float)
         aLy_k = np.asarray(aLy_k, dtype=float)
         scale = np.maximum(aLy_k, 1e-3)
         lo, hi = self._theta_bounds()
 
-        if p0 is not None:
-            # WARM path (solver hot loop): the previous fit is a converged solution for
-            # nearby DVs, so a hand-rolled LM from it takes 1-2 iterations (~1 ms, no
-            # scipy overhead) and stays in that (good) basin.
-            best_theta, best_cost, best_r, best_J = self._lm_solve(p0, x_k, aLy_k, y_bc, aLy_bc, scale, lo, hi)
-        else:
-            # COLD path (first eval, no history): robust scipy TRF over a deterministic
-            # c-seed spread, argmin on the interior residual. This is the ~1/solve cold
-            # cost (rare -- the solver reuses one parameterizer, so all later evals are
-            # warm), and it is a pure function of the inputs (deterministic).
-            def fun(th):
-                return np.nan_to_num(self._resid_jac(th, x_k, aLy_k, y_bc, aLy_bc, scale)[0],
-                                     nan=1e6, posinf=1e6, neginf=-1e6)
+        # ONE path: a fixed multistart, best-of by interior knot error. There is no
+        # warm/cold split -- ``p0`` is accepted for signature compatibility and ignored.
+        # A warm seed made the fit a function of the optimizer's HISTORY rather than of
+        # the DVs: re-fitting the same DVs from a seed 5% away moved aLy(0.985) by tens
+        # of percent, and warm-chaining the real Imode trajectory moved y at the
+        # transport radii by up to 68% against a cold fit. Best-of over fixed seeds costs
+        # a few ms and restores "profile = f(knots, BCs)".
+        best_theta = best_r = best_J = None
+        best_rel = np.inf
+        for seed in self._seed_bank(aLy_k, aLy_bc):
+            try:
+                th, _, r, J = self._lm_solve(np.clip(seed, lo, hi), x_k, aLy_k,
+                                             y_bc, aLy_bc, scale, lo, hi)
+            except Exception:
+                continue
+            rel = self._interior_maxrel_theta(th, x_k, aLy_k, y_bc, aLy_bc)
+            if rel < best_rel:
+                best_theta, best_rel, best_r, best_J = th, rel, r, J
+            if best_rel <= self.fit_max_rel_error:
+                break                       # good enough; don't pay for more seeds
+        if best_theta is None:
+            best_theta = self._default_theta0(aLy_k, aLy_bc)
+            best_rel = self._interior_maxrel_theta(best_theta, x_k, aLy_k, y_bc, aLy_bc)
+            best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
 
-            def jac(th):
-                return np.nan_to_num(self._resid_jac(th, x_k, aLy_k, y_bc, aLy_bc, scale)[1],
-                                     nan=0.0, posinf=0.0, neginf=0.0)
-            seeds = [self._default_theta0(aLy_k, aLy_bc)]
-            seeds += [np.array([self.s0, c0, self.w1_0, 0.5], dtype=float) for c0 in (0.93, 0.97, 1.02)]
-            best_theta, best_rel = None, np.inf
-            for seed in seeds:
-                try:
-                    cand = np.asarray(least_squares(
-                        fun, np.clip(seed, lo, hi), jac=jac, bounds=(lo, hi), method='trf',
-                        ftol=self.fit_trf_ftol, gtol=self.fit_trf_gtol, xtol=self.fit_trf_xtol,
-                        x_scale='jac', max_nfev=self.fit_max_nfev).x, dtype=float)
-                except Exception:
-                    continue
+        # Escalate to a bounded TRF polish only when the cheap LM has not got there.
+        # _lm_solve is a plain damped Gauss-Newton: fast (~2 ms for the whole seed sweep)
+        # but it stalls well short of the true minimum on the harder edges (median knot
+        # error 0.65 vs TRF's 0.15, tail to 4.2 vs 0.45), and tightening its own
+        # tolerances does not help -- it is converging, just to a worse point. One
+        # short-budget TRF from the best LM point recovers full TRF accuracy for about a
+        # third of the cost of a TRF multistart.
+        if best_rel > self.fit_polish_rel:
+            try:
+                cand = np.asarray(least_squares(
+                    lambda th: np.nan_to_num(
+                        self._resid_jac(th, x_k, aLy_k, y_bc, aLy_bc, scale)[0],
+                        nan=1e6, posinf=1e6, neginf=-1e6),
+                    best_theta,
+                    jac=lambda th: np.nan_to_num(
+                        self._resid_jac(th, x_k, aLy_k, y_bc, aLy_bc, scale)[1],
+                        nan=0.0, posinf=0.0, neginf=0.0),
+                    bounds=(lo, hi), method='trf', xtol=self.fit_trf_xtol,
+                    ftol=self.fit_trf_ftol, gtol=self.fit_trf_gtol, x_scale='jac',
+                    max_nfev=self.fit_polish_nfev).x, dtype=float)
                 rel = self._interior_maxrel_theta(cand, x_k, aLy_k, y_bc, aLy_bc)
                 if rel < best_rel:
                     best_theta, best_rel = cand, rel
-                if best_rel <= self.fit_max_rel_error:
-                    break
-            if best_theta is None:
-                best_theta = self._default_theta0(aLy_k, aLy_bc)
-            best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
+                    best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k,
+                                                     y_bc, aLy_bc, scale)
+            except Exception:
+                pass
 
         # Runaway peak guard (detection-gated -> no cost/perturbation on well-behaved
         # fits). If the fitted backbone overshoots the cap anywhere on [x0,1], do ONE
@@ -2113,11 +2349,12 @@ class SplineMtanhAnalytic(ParameterBase):
         # accept-if-under-cap, so a converged fit can still sit above the cap -- the UQ
         # projection in _apply_theta_offset accounts for that.
         if self._peak_penalty_on and aLy_k.size:
-            cap = self._peak_cap(aLy_k, aLy_bc)
-            if self._profile_peak(best_theta, y_bc, aLy_bc) > cap:
+            cap = self._peak_cap_profile(aLy_k, aLy_bc)
+            if self._peak_excess(best_theta, y_bc, aLy_bc, cap) > 1.0:
                 th_pen, _, _, _ = self._lm_solve(best_theta, x_k, aLy_k, y_bc, aLy_bc,
                                                  scale, lo, hi, peak_cap=cap)
-                if self._profile_peak(th_pen, y_bc, aLy_bc) < self._profile_peak(best_theta, y_bc, aLy_bc):
+                if (self._peak_excess(th_pen, y_bc, aLy_bc, cap)
+                        < self._peak_excess(best_theta, y_bc, aLy_bc, cap)):
                     best_theta = th_pen
                     best_r, best_J = self._resid_jac(best_theta, x_k, aLy_k, y_bc, aLy_bc, scale)
 
@@ -2170,7 +2407,7 @@ class SplineMtanhAnalytic(ParameterBase):
           the peak -- the bimodal samples), s inside (0,1) (keeps m >= 0).
         * shape projection -- the offset direction comes from a LINEAR profile Jacobian
           but is applied as a FINITE step through a nonlinear reconstruction, so its
-          amplitude is bisected down until the sample is feasible: peak under _peak_cap
+          amplitude is bisected down until the sample is feasible: peak under _peak_cap_profile
           AND no turnover (_has_interior_dip).  The direction is preserved and only its
           magnitude is bounded, so each scan direction stays symmetric about nominal
           rather than being truncated on one side.  NB the clip alone does NOT prevent
@@ -2186,7 +2423,12 @@ class SplineMtanhAnalytic(ParameterBase):
         off = np.asarray(off, dtype=float)
         lo, hi = self._theta_bounds()
         th_full = np.clip(theta + off, lo, hi)
-        if not self._peak_penalty_on or y_bc is None or aLy_bc is None:
+        if y_bc is None or aLy_bc is None:
+            return th_full
+        # The peak rule and the dip rule are independently switchable: disabling the
+        # peak penalty must not silently drop turnover rejection too (they guard
+        # different failure modes -- height vs shape).
+        if not (self._peak_penalty_on or self._unimodal_proj_on):
             return th_full
 
         # alpha=0 must be feasible for the bisection to be well posed.  The fit-time
@@ -2196,13 +2438,19 @@ class SplineMtanhAnalytic(ParameterBase):
         # never worse-peaked or worse-shaped than the cap or the nominal, whichever is
         # looser" -- it conditions the excursion without re-shaping the nominal.
         aLy_nom = self._backbone_aLy(theta, y_bc, aLy_bc)
-        cap = max(self._peak_cap(aLy_k, aLy_bc),
-                  float(np.max(aLy_nom)) if aLy_nom.size else 0.0)
+        cap = None
+        if self._peak_penalty_on:
+            cap = self._peak_cap_profile(aLy_k, aLy_bc)
+            # Scale the cap up if the nominal fit already violates it, so alpha=0 stays
+            # feasible and the bisection is well posed.
+            nom_excess = self._peak_excess(theta, y_bc, aLy_bc, cap)
+            if nom_excess > 1.0:
+                cap = cap * nom_excess
         dip_ok = self._unimodal_proj_on and not self._has_interior_dip(aLy_nom)
 
         def feasible(th):
             aLy_p = self._backbone_aLy(th, y_bc, aLy_bc)
-            if aLy_p.size and float(np.max(aLy_p)) > cap:
+            if cap is not None and aLy_p.size and np.any(aLy_p > cap):
                 return False
             return not (dip_ok and self._has_interior_dip(aLy_p))
 

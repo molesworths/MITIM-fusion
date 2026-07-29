@@ -74,10 +74,14 @@ def _inv_softplus(y):
     return y + torch.log(-torch.expm1(-y))
 
 
+# Both transforms index the LAST axis, so they accept a single DV vector (n,) or a whole
+# batch (B, n) unchanged -- the batched form is what lets one posterior call cover a full
+# finite-difference stencil (see _inner_jac).
+
 def forward_transform(x_phys, mono_pairs):
     x_opt = x_phys.clone()
     for (i, j) in mono_pairs:
-        x_opt[j] = _inv_softplus(x_phys[j] - x_phys[i])
+        x_opt[..., j] = _inv_softplus(x_phys[..., j] - x_phys[..., i])
     return x_opt
 
 
@@ -85,7 +89,7 @@ def inverse_transform(x_opt, mono_pairs):
     x_phys = x_opt.clone()
     for (i, j) in mono_pairs:
         x_phys = x_phys.clone()
-        x_phys[j] = x_phys[i] + torch.nn.functional.softplus(x_opt[j])
+        x_phys[..., j] = x_phys[..., i] + torch.nn.functional.softplus(x_opt[..., j])
     return x_phys
 
 
@@ -215,6 +219,10 @@ class SALM:
         inner_ftol=1e-6,
         inner_gtol=1e-6,
         inner_max_nfev=200,
+        # Build the inner Jacobian from one batched GP posterior instead of scipy's
+        # point-by-point 2-point differencing (identical stencil, ~13x fewer posterior
+        # calls). False reverts to scipy's own finite differences.
+        inner_batched_jac=True,
         train_Ystd_rel=None,
     )
 
@@ -424,6 +432,57 @@ class SALM:
         with torch.no_grad():
             return self._residual_vector(x_opt).detach().cpu().numpy()
 
+    def _residuals_batch_np(self, X_opt_np):
+        """Residuals for a BATCH of points (B, ndv) -> (B, n_res), in ONE posterior call.
+
+        A single-point posterior over the per-output ModelList costs ~0.24 s, essentially
+        all fixed overhead, so evaluating a 13-point finite-difference stencil one point
+        at a time costs ~3 s where the batch costs ~0.25 s. Same arithmetic, ~13x less
+        botorch bookkeeping."""
+        X_opt = torch.from_numpy(np.atleast_2d(X_opt_np)).to(self.dfT)
+        with torch.no_grad():
+            X_phys = inverse_transform(X_opt, self.mono_pairs)
+            y_mean, _, _, _ = self.gp_combined.predict(X_phys)
+            if self._corr_delta_Y is not None:
+                y_mean = y_mean + self._corr_delta_Y
+            of, cal, _ = self.fun.scalarized_objective(y_mean)
+            R = (cal - of)
+            self.n_flux = int(R.shape[-1])
+            return R.detach().cpu().numpy()
+
+    def _inner_jac(self, x_opt_np, anchor, sqrtW, ridge_w, lo_box, hi_box):
+        """Forward-difference Jacobian of _inner_residual, built from ONE batched
+        posterior instead of scipy's point-by-point `jac="2-point"`.
+
+        Steps are clipped into the trust-region box and the ACTUAL taken step is used as
+        the denominator, so a variable pinned to a box face gets a one-sided difference
+        rather than a step that silently leaves the region."""
+        o = self.options
+        n = x_opt_np.size
+        h = o["inner_diff_step"] * np.maximum(np.abs(x_opt_np), 1.0)
+
+        # keep every perturbed point inside the box; flip to a backward step at the edge
+        xp = np.repeat(x_opt_np[None, :], n, axis=0)
+        idx = np.arange(n)
+        step = h.copy()
+        forward = (x_opt_np + h) <= hi_box
+        step = np.where(forward, h, -h)
+        too_low = (x_opt_np + step) < lo_box
+        step = np.where(too_low, hi_box - x_opt_np, step)          # degenerate box: span it
+        step = np.where(np.abs(step) < 1e-30, 1e-12, step)
+        xp[idx, idx] = x_opt_np + step
+
+        R = self._residuals_batch_np(np.vstack([x_opt_np[None, :], xp]))   # (n+1, n_res)
+        J = ((R[1:] - R[0][None, :]) / step[:, None]).T                    # (n_res, n)
+        J = sqrtW[:, None] * J
+
+        idxs = self._interior_idx
+        if ridge_w > 0.0 and idxs.size:
+            P = np.zeros((idxs.size, n))
+            P[np.arange(idxs.size), idxs] = ridge_w / self._dv_scale[idxs]
+            J = np.vstack([J, P])
+        return J
+
     def _flux_pred_np(self, x_opt_np):
         """Surrogate-predicted flux squared-residual (partitioned data term)."""
         R = self._residuals_np(x_opt_np)
@@ -624,7 +683,35 @@ class SALM:
             if optimize:
                 GP.fit()
             else:
-                GP.gpmodel.load_state_dict(prev[i].gpmodel.state_dict())
+                # Copy only the entries whose shape still matches. The point of the warm
+                # path is to reuse the HYPERPARAMETERS (lengthscales, outputscale, mean,
+                # noise level) -- everything sized by the training-set length is rebuilt
+                # right after by normalization_pass anyway.
+                #
+                # A plain load_state_dict() here NEVER succeeded: the outcome transform
+                # keeps (n_points, 1) buffers (means / stdvs / _stdvs_sq), so every time
+                # the training set grew by one point it raised a size mismatch and the
+                # caller silently fell back to a FULL hyperparameter refit (~50 s/iter).
+                #
+                # This filter clears that blocker (21 hyperparameter tensors reused, 3
+                # size-dependent buffers rebuilt), but the warm path is STILL not reached:
+                # normalization_pass -> input_transform_physics(train_X) then fails with
+                # "Expected at least 4 params for 'te', got 3", i.e. the physics input
+                # transform is re-applied to already-transformed features. That second
+                # blocker lives in the shared SURROGATEtools / Transformation_Inputs
+                # plumbing (the `parameters_combined` cache) that every PORTALS run uses,
+                # so it is deliberately NOT patched here. Until it is fixed the try/except
+                # in _fit_surrogates still falls back to a full fit -- behaviour unchanged.
+                sd_src = prev[i].gpmodel.state_dict()
+                sd_dst = GP.gpmodel.state_dict()
+                compatible = {k: v for k, v in sd_src.items()
+                              if (k in sd_dst) and (sd_dst[k].shape == v.shape)}
+                n_skipped = len(sd_src) - len(compatible)
+                GP.gpmodel.load_state_dict(compatible, strict=False)
+                if i == 0 and n_skipped:
+                    print(f"\t- SALM warm update: reused {len(compatible)} hyperparameter "
+                          f"tensors, rebuilt {n_skipped} size-dependent buffer(s)",
+                          typeMsg="i")
                 GP.normalization_pass(
                     GP.gpmodel.input_transform["tf1"], GP.gpmodel.input_transform["tf2"],
                     GP.gpmodel.outcome_transform["tf1"], GP.gpmodel.outcome_transform["tf2"],
@@ -998,9 +1085,18 @@ class SALM:
             hi_box[degenerate] = lo_box[degenerate] + 1e-12
             x0 = np.clip(anchor, lo_box, hi_box)
 
+            # Supply the Jacobian instead of letting scipy finite-difference it: scipy
+            # would call the residual once per DV perturbation, and each call is a full
+            # ModelList posterior (~0.24 s of mostly fixed overhead). _inner_jac gets the
+            # whole stencil from ONE batched posterior. Set inner_batched_jac=False to
+            # fall back to scipy's 2-point differencing.
+            if o.get("inner_batched_jac", True):
+                jac_arg = lambda x: self._inner_jac(x, anchor, sqrtW, ridge_w, lo_box, hi_box)
+            else:
+                jac_arg = "2-point"
             sol = least_squares(
                 lambda x: self._inner_residual(x, anchor, sqrtW, ridge_w), x0,
-                jac="2-point", diff_step=o["inner_diff_step"],
+                jac=jac_arg, diff_step=o["inner_diff_step"],
                 bounds=(lo_box, hi_box), method="trf", x_scale=o["inner_x_scale"],
                 xtol=o["inner_xtol"], ftol=o["inner_ftol"], gtol=o["inner_gtol"],
                 max_nfev=o["inner_max_nfev"],

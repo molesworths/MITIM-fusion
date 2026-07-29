@@ -899,6 +899,11 @@ class powerstate_edge(powerstate):
         # Optimize
         x_best,Yopt, Xopt, metric_history = solver_fun(evaluator,x0, bounds=self.bounds_current,solver_options=solver_options_use)
 
+        # Leave the powerstate AT the best solution (profiles consistent with x_best) so
+        # the pedestal can be read off and x_best warm-starts the next continuation step.
+        self.FluxMatch_xbest = x_best.detach().clone()
+        self.modify(self.FluxMatch_xbest)
+
         # For simplicity, return the trajectory of only the best candidate
 
         idx_flat = metric_history.argmax()

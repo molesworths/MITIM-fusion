@@ -180,6 +180,17 @@ class _Transformation_Outcomes_GBbase(BOTORCHtools.Transformation_Outcomes):
 
     _EPS = 1e-8
 
+    @property
+    def _is_linear(self):
+        """Both warps (ln, asinh) are NONLINEAR, so untransform_posterior returns a
+        TransformedPosterior, not a GPyTorchPosterior. The Standardize base inherits
+        _is_linear=True, which is wrong here and is load-bearing: ModelListGP.posterior
+        uses it to decide whether it may merge the per-output posteriors by reading
+        ``p.distribution`` off each one -- a path that raises AttributeError as soon as one
+        model in the list is warped. Overriding it is what lets a MIXED ModelListGP (warped
+        turbulent-flux outputs alongside plain targets) build a posterior at all."""
+        return False
+
     def _factor(self, X):
         if (self.output is not None) and self.flag_to_evaluate:
             return self.surrogate_parameters["transformationOutputs"](

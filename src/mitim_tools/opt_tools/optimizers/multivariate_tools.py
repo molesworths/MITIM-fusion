@@ -199,6 +199,13 @@ def simple_relaxation( flux_residual_evaluator, x_initial, bounds=None, solver_o
     relax_dyn_decrease = solver_options.get("relax_dyn_decrease", 5)   # Decrease relax by this factor
     relax_dyn_num = solver_options.get("relax_dyn_num", 100)            # Number of iterations to average over and check if the residual is decreasing
 
+    # DV-settle stop (for L-H/H-L continuation sweeps): converge when the design vector
+    # has stopped moving -- mean ||X[i]-X[i-1]|| / ||X[i-1]|| over the last dv_rel_num
+    # iterations drops below dv_rel_tol (e.g. 0.05 = 5%). Complements the metric tol and
+    # the oscillation detector, and does NOT depend on a GP surrogate (pure relaxation).
+    dv_rel_tol = solver_options.get("dv_rel_tol", None)
+    dv_rel_num = int(solver_options.get("dv_rel_num", 5))
+
     print_each = solver_options.get("print_each", 1e2)
     write_trajectory = solver_options.get("write_trajectory", True)
 
@@ -295,6 +302,16 @@ def simple_relaxation( flux_residual_evaluator, x_initial, bounds=None, solver_o
         if (tol is not None) and (M.max().item() > tol):
             print(f"\t* Converged in {i+1} iterations with metric of {metric_best:.2e} > {tol:.2e}",typeMsg="i")
             break
+
+        # DV-settle stop: mean relative step over the last dv_rel_num iterations < dv_rel_tol
+        if (dv_rel_tol is not None) and (len(x_history) > dv_rel_num + 1):
+            xs = torch.stack(x_history[-(dv_rel_num + 1):])                       # (N+1, batch, dim)
+            rel = ((xs[1:] - xs[:-1]).norm(dim=-1)
+                   / xs[:-1].norm(dim=-1).clamp(min=1e-9)).mean(dim=0)            # (batch,)
+            if bool((rel < dv_rel_tol).all()):
+                print(f"\t* Converged (DV settle @{i+1}): mean rel step {rel.max().item():.2%} "
+                      f"< {dv_rel_tol:.0%} over last {dv_rel_num} iters", typeMsg="i")
+                break
 
         # Update the dynamic relax if needed
         if relax_dyn:
