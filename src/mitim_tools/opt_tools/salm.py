@@ -163,7 +163,14 @@ class SALM:
         # _edge_uq_history for downstream analysis. False reverts to per-eval UQ.
         edge_uq_final_only=True,
         # trust region (fraction of opt-space dv_scale)
-        tr_init=5e-3,
+        # NB tr_init MUST stay above tr_min: run() sets the live radius with
+        # np.clip(tr_init, tr_min, max_total_rel_step), so any tr_init <= tr_min is
+        # silently swallowed and the TR starts pinned AT its floor. That also makes the
+        # "TR floor stall" reset (which restores tr_init) a no-op on the radius -- the
+        # run can then only ratchet between tr_min and a couple of doublings and every
+        # step comes out boundary-limited (step_frac ~ 1). The old default 5e-3 < tr_min
+        # did exactly this; every working driver was passing tr_init=5e-2 by hand.
+        tr_init=5e-2,
         tr_min=1e-2,
         max_total_rel_step=0.4,
         tr_shrink=0.4,

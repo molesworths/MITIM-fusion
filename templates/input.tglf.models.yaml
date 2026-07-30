@@ -81,8 +81,9 @@
     UNITS: CGYRO
     USE_BPER: True
     USE_BPAR: True
-    NBASIS_MAX: 12
+    NBASIS_MAX: 16
     WIDTH: 3
     WIDTH_MIN: 0.1
     NMODES: 2
     NXGRID: 32
+    RLNP_CUTOFF: 1000.
