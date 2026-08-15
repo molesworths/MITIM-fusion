@@ -307,6 +307,7 @@ def run_edge_uq(
     fit_error_step: float = 0.1,
     lcfs_aly_mode: str = "auto",
     outlier_factor: float = 8.0,
+    outlier_min_ratio: float = 3.0,
     use_surrogate_gp: bool = False,
     near_optimum: Optional[bool] = None,
     inject_into=None,
@@ -411,6 +412,7 @@ def run_edge_uq(
                  rotation_proxy=rotation_proxy, transport_proxy=transport_proxy,
                  folder=folder)
     st.outlier_factor = outlier_factor
+    st.outlier_min_ratio = outlier_min_ratio
     profile_std = None
     # The OF flux keys (Ge/GZ/Qe.../Mt...) are ALWAYS scanned so their native-unit
     # std can be injected into the exact keys the GP reads -- this is the correct,

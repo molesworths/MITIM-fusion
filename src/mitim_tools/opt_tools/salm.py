@@ -198,6 +198,19 @@ class SALM:
         # convergence (on real evaluations only)
         res_tol=1e-5,
         xtol=1e-4,
+        # DV-based convergence: stop once the design vector stops moving, i.e. an
+        # ACCEPTED step changes x by less than this RELATIVE L2 fraction
+        # (|x_new - x_old| / |x_old|). 0.01 = the "converged to 1% in the DVs" rule.
+        #
+        # This is deliberately NOT `xtol`. `xtol` is an ABSOLUTE step threshold that
+        # only gates the surrogate-stationary branch below, where convergence is
+        # additionally conditional on res_cur < res_tol; when the residual is above
+        # res_tol (always, in practice -- res_tol=1e-5 is never reached on these edge
+        # cases) that branch treats a small step as a STALL and shrinks the TR. So
+        # raising `xtol` makes runs stall EARLIER rather than declaring convergence.
+        # xtol_rel gives the DV test its own exit that does not consult the residual.
+        # 0.0 disables (previous behaviour).
+        xtol_rel=0.0,
         max_real_evals=25,
         # Diminishing-returns early exit: stop when an ACCEPTED step improves the best
         # flux_sq by less than plateau_rel_tol per eval (geometric mean) over the last
@@ -1115,6 +1128,15 @@ class SALM:
             # --- stationary surrogate: convergence iff the real residual is matched ---
             if step < o["xtol"]:
                 res_cur = np.sqrt(max(f_cur, 0.0)) / self.n_flux
+                # Same DV rule on the stationary-surrogate path: if the proposed step is
+                # this small RELATIVE to x, the design vector has settled -- report that
+                # as convergence instead of shrinking the TR into a floor stall.
+                if float(o.get("xtol_rel", 0.0) or 0.0) > 0.0 and \
+                        step / max(float(np.linalg.norm(anchor)), 1e-12) < o["xtol_rel"]:
+                    print(f"SALM converged (surrogate stationary, DV step "
+                          f"|dx|/|x|={step / max(float(np.linalg.norm(anchor)), 1e-12):.3e} "
+                          f"< xtol_rel, res={res_cur:.3e})", typeMsg="i")
+                    break
                 if res_cur < o["res_tol"]:
                     print(f"SALM converged (surrogate stationary, res={res_cur:.3e}, "
                           f"|step|={step:.2e})", typeMsg="i")
@@ -1173,6 +1195,17 @@ class SALM:
                 x_cur = x_trial
                 f_cur = f_real
                 self._set_anchor(x_trial, best_Y)
+                # DV convergence (xtol_rel): the accepted step no longer moves the
+                # design vector appreciably, so the solution has settled regardless of
+                # what the residual floor happens to be. `anchor` is still the PRE-step
+                # x here, and step = |x_trial - anchor|, so this is |dx|/|x|.
+                if float(o.get("xtol_rel", 0.0) or 0.0) > 0.0:
+                    rel_dx = step / max(float(np.linalg.norm(anchor)), 1e-12)
+                    if rel_dx < o["xtol_rel"]:
+                        print(f"SALM converged (DV step |dx|/|x|={rel_dx:.3e} < "
+                              f"xtol_rel={o['xtol_rel']:.3e}, res={res_real:.3e})",
+                              typeMsg="i")
+                        break
             else:
                 x_cur = anchor.copy()
                 self._recompute_correction()

@@ -5,3 +5,11 @@
 "Nonlinear":
   controls:
     NONLINEAR_FLAG: 1
+
+
+"edge":
+  controls:
+    N_XI: 32
+    N_THETA: 32
+    N_ENERGY: 16
+    

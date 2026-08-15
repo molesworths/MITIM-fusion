@@ -82,9 +82,10 @@
     USE_BPER: True
     USE_BPAR: True
     NBASIS_MAX: 16
-    WIDTH: 4
-    WIDTH_MIN: 0.02
+    WIDTH: 6
+    WIDTH_MIN: 0.1
     NWIDTH: 41
     NMODES: 2
-    NXGRID: 32
+    NXGRID: 64
     RLNP_CUTOFF: 1000.
+    NKY: 24

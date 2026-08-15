@@ -2850,9 +2850,186 @@ class SplineMtanhAnalytic(ParameterBase):
 # "SplineMtanh" / "spline_mtanh" resolve to the merged class.
 SplineMtanh = SplineMtanhAnalytic
 
+
+# -------------------------
+# Two-point clamped Hermite (single segment) parameterizer
+# -------------------------
+
+
+class ClampedHermite(ParameterBase):
+    """Single clamped-cubic segment spanning [x_test, 1] from (y, a/Ly) at both ends.
+
+    Built for the pedestal-top flux-match study: the LCFS end is pinned by the
+    boundary model, the inner end at ``x_test`` carries the two free controls per
+    channel, and everything between is the unique cubic Hermite interpolant. There
+    is no shape freedom left in the segment -- 4 conditions, 4 cubic coefficients.
+
+    Design parameters per profile: ``["y0", "aLy0"]`` (value and a/Ly at x_test).
+
+    Parameters (options)
+    --------------------
+    knots : Sequence[float]
+        Single entry, the inner endpoint x_test = (r/a)_test. Longer sequences are
+        rejected -- this model is one segment by construction.
+    x_outer : float
+        Outer endpoint location (default 1.0, the LCFS).
+    inner_extrapolation : str
+        Behaviour for x < x_test on the evaluation grid: 'exponential' (default)
+        holds a/Ly = aLy0 so y stays positive, 'cubic' continues the Hermite
+        polynomial (can go negative -- diagnostics only).
+
+    Conventions
+    -----------
+    x is roa and a/Ly = -(dy/dx)/y, so the clamped end slopes are
+    ``dy/dx = -aLy * y``, matching ``Spline._integrate_aLy``.
+    """
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+
+        knots = np.atleast_1d(np.asarray(options.get('knots', []), dtype=float))
+        if knots.size != 1:
+            raise ValueError(
+                f"ClampedHermite spans a single segment and takes exactly one knot "
+                f"(the inner endpoint x_test); got {knots.size}: {knots}"
+            )
+        self.knots = knots
+        self.x_test = float(knots[0])
+        self.x_outer = float(options.get('x_outer', 1.0))
+        if not (self.x_outer > self.x_test):
+            raise ValueError(
+                f"ClampedHermite requires x_outer > x_test; got x_test={self.x_test}, "
+                f"x_outer={self.x_outer}"
+            )
+
+        self.inner_extrapolation = str(options.get('inner_extrapolation', 'exponential')).lower()
+        if self.inner_extrapolation not in ('exponential', 'cubic'):
+            raise ValueError("inner_extrapolation must be 'exponential' or 'cubic'")
+
+        # This model always carries both a value and a gradient control; 'defined_on'
+        # is accepted for config symmetry with the other parameterizers but is not a
+        # switch here.
+        self.defined_on = 'y_aLy'
+        self.param_names = ['y0', 'aLy0']
+        self.n_params_per_profile = 2
+
+    # ------------------------------
+    # Internal utilities
+    # ------------------------------
+    def _endpoint_bcs(self, prof: str) -> Tuple[float, float]:
+        """(y1, aLy1) at the outer endpoint, read from the normalized BC dict."""
+        bc_y = self.get_nearest_bc(prof, self.x_outer)
+        bc_aLy = self.get_nearest_bc(f"aL{prof}", self.x_outer)
+        if bc_y is None or bc_aLy is None:
+            raise ValueError(
+                f"ClampedHermite needs both '{prof}' and 'aL{prof}' boundary conditions at "
+                f"x={self.x_outer}; got y={bc_y}, aLy={bc_aLy}"
+            )
+        return float(bc_y['val']), float(bc_aLy['val'])
+
+    def _coefficients(self, params: Dict[str, Any], prof: str) -> Tuple[float, float, float, float, float]:
+        """Return (y0, m0, y1, m1, h) for the Hermite segment of one profile."""
+        p = params[prof]
+        if isinstance(p, dict):
+            y0 = float(np.asarray(p['y0']).reshape(-1)[0])
+            aLy0 = float(np.asarray(p['aLy0']).reshape(-1)[0])
+        else:
+            arr = np.asarray(p, dtype=float).reshape(-1)
+            y0, aLy0 = float(arr[0]), float(arr[1])
+
+        y1, aLy1 = self._endpoint_bcs(prof)
+
+        # dy/dx = -aLy * y at both clamped ends
+        return y0, -aLy0 * y0, y1, -aLy1 * y1, self.x_outer - self.x_test
+
+    def _evaluate(self, params: Dict[str, Any], prof: str, x_eval: np.ndarray, order: int) -> np.ndarray:
+        """Hermite segment (and its inner extension) differentiated `order` times."""
+        y0, m0, y1, m1, h = self._coefficients(params, prof)
+        x = np.asarray(x_eval, dtype=float)
+        t = (x - self.x_test) / h
+
+        if order == 0:
+            b = (2 * t**3 - 3 * t**2 + 1, h * (t**3 - 2 * t**2 + t),
+                 -2 * t**3 + 3 * t**2, h * (t**3 - t**2))
+            scale = 1.0
+        elif order == 1:
+            b = (6 * t**2 - 6 * t, h * (3 * t**2 - 4 * t + 1),
+                 -6 * t**2 + 6 * t, h * (3 * t**2 - 2 * t))
+            scale = 1.0 / h
+        elif order == 2:
+            b = (12 * t - 6, h * (6 * t - 4),
+                 -12 * t + 6, h * (6 * t - 2))
+            scale = 1.0 / h**2
+        else:
+            raise ValueError(f"order must be 0, 1 or 2; got {order}")
+
+        out = scale * (b[0] * y0 + b[1] * m0 + b[2] * y1 + b[3] * m1)
+
+        if self.inner_extrapolation == 'exponential':
+            # x < x_test: hold a/Ly at aLy0 so y = y0*exp(-aLy0*(x-x_test)) stays
+            # positive definite no matter how the segment is loaded. Only a couple of
+            # grid points sit here (the powerstate grid starts just inside x_test).
+            inner = x < self.x_test
+            if np.any(inner):
+                aLy0 = -m0 / y0 if y0 != 0.0 else 0.0
+                y_in = y0 * np.exp(-aLy0 * (x - self.x_test))
+                repl = {0: y_in, 1: -aLy0 * y_in, 2: aLy0**2 * y_in}[order]
+                out = np.where(inner, repl, out)
+
+        return out
+
+    # ------------------------------
+    # ParameterBase interface
+    # ------------------------------
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Read (y, a/Ly) at x_test off an experimental state view."""
+        if self.bounds is None:
+            self.bounds = {'y0': (0.0, np.inf), 'aLy0': (0.0, 100.0)}
+
+        self.a = getattr(state, 'a', 1.0)
+        self.build_bcs(bc_dict)
+
+        roa = np.asarray(getattr(state, 'roa')).flatten()
+
+        params: Dict[str, Any] = {}
+        for prof in self.predicted_profiles:
+            def _raw(attr):
+                arr = np.asarray(getattr(state, attr))
+                return (arr[:, 0] if arr.ndim == 2 else arr).flatten()
+
+            params[prof] = {
+                'y0': float(np.interp(self.x_test, roa, _raw(prof))),
+                'aLy0': float(np.interp(self.x_test, roa, _raw(f"aL{prof}"))),
+            }
+
+        self.params = params
+        self.param_std = {
+            prof: {name: abs(val) * self.sigma for name, val in vals.items()}
+            for prof, vals in params.items()
+        }
+        return params, self.param_std
+
+    def get_y(self, params: Dict[str, np.ndarray], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        return {prof: self._evaluate(params, prof, x_eval, 0) for prof in self.predicted_profiles}
+
+    def get_aLy(self, params: Dict[str, np.ndarray], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        out = {}
+        for prof in self.predicted_profiles:
+            y = self._evaluate(params, prof, x_eval, 0)
+            dy = self._evaluate(params, prof, x_eval, 1)
+            # y<=0 is a segment pathology, not a physical state; surface it as NaN so
+            # the caller's validity screen catches it instead of a silent sign flip.
+            out[prof] = np.where(y > 0.0, -dy / np.where(y > 0.0, y, 1.0), np.nan)
+        return out
+
+    def get_curvature(self, params: Dict[str, np.ndarray], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        return {prof: self._evaluate(params, prof, x_eval, 2) for prof in self.predicted_profiles}
+
+
 PARAMETER_MODELS = {
     'spline': Spline,
     'mtanh': Mtanh,
+    'clamped_hermite': ClampedHermite,
     'spline_mtanh': SplineMtanhAnalytic,
     'spline_mtanh_analytic': SplineMtanhAnalytic,
 }

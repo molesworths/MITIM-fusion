@@ -86,6 +86,10 @@ class UQState:
         self.rotation_proxy = rotation_proxy
         # Robust-outlier factor for garbage-corner screening (None disables).
         self.outlier_factor = 8.0
+        # Absolute companion gate: a column must exceed this multiple of the median
+        # residual response before it can be dropped. Guards against MAD collapse
+        # when most inputs are inert -- see _screen_garbage_cols.
+        self.outlier_min_ratio = 3.0
         # CRITICAL for in-loop use: the UQ forward re-runs powerstate.calculate()
         # on copies.  If the transport evaluator is the real code (TGLF/NEO) that
         # re-runs it many times per pass -- unusable.  ``transport_proxy`` is a
@@ -532,7 +536,24 @@ class UQState:
 
     def _screen_garbage_cols(self, res_cols, obs_cols, cols, factor=8.0):
         """Zero columns whose residual response is an extreme robust outlier
-        (median-absolute-deviation based).  Returns the dropped column ids."""
+        (median-absolute-deviation based).  Returns the dropped column ids.
+
+        The MAD test alone is NOT sufficient. When most inputs are inert (the
+        neutral/impurity source columns barely move the turbulent flux within one
+        evaluation) the surviving norms cluster, MAD collapses toward zero, and
+        `med + factor*mad` degenerates to ~med -- so ANY input with genuine
+        sensitivity reads as an extreme outlier no matter how large `factor` is.
+        Observed on the NT case: all 12 norms within 1.09x of each other, yet the
+        three LCFS boundary conditions -- the most physically influential inputs in
+        the set -- were dropped, zeroing every separatrix band.
+
+        `outlier_min_ratio` is the ABSOLUTE guard against that: a column must also
+        exceed this multiple of the median before it can be dropped. It is a plain
+        ratio, so it does not care how tight the cluster is. The historical value
+        was a hard-coded 3.0; anything at or below that is far too aggressive for a
+        well-behaved scan (a real pathology is the ~70x Ge_tr excursion this screen
+        was written for, not a 3x sensitivity).
+        """
         if len(res_cols) < 3 or factor is None or factor <= 0:
             return []
         norms = torch.tensor([float(torch.linalg.vector_norm(c)) for c in res_cols])
@@ -542,9 +563,10 @@ class UQState:
         med = float(pos.median())
         mad = float((pos - med).abs().median()) or float(pos.std()) or med
         thresh = med + factor * mad
+        min_ratio = float(getattr(self, "outlier_min_ratio", 3.0) or 3.0)
         dropped = []
         for i, n in enumerate(norms):
-            if float(n) > thresh and float(n) > 3.0 * med:
+            if float(n) > thresh and float(n) > min_ratio * med:
                 res_cols[i] = torch.zeros_like(res_cols[i])
                 for k in obs_cols:
                     obs_cols[k][i] = torch.zeros_like(obs_cols[k][i])
