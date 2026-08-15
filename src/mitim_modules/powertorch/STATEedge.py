@@ -79,6 +79,22 @@ class powerstate_edge(powerstate):
         ("bc_model_options",            {}),
         ("charge_state_model",          "Null"),
         ("charge_state_model_options",  {}),
+        # How the charge-state ladder collapses onto the single GACODE impurity species.
+        #   "charge_density" (default) : n_rep = sum_z z n_z / Z_imp  -> charge density exact
+        #   "fully_stripped"           : n_rep = n_z(Z_imp)           -> legacy, archived runs
+        # Who owns the impurity DENSITY:
+        #   "charge_state_model" (default) : Aurora's steady-state solve; amplitude anchored by
+        #                                    prep_calibrated -> source_rate -> LCFS Z_eff
+        #   "prescribed"                   : the initial profile's f_Z carried with ne. Aurora
+        #                                    still supplies the charge-state fractions for
+        #                                    radiation / qpar_imp / qpar_Z / Zeff, but its
+        #                                    transport solve does NOT set the level, so the
+        #                                    Z_eff calibration is inert in this mode.
+        ("impurity_density_source",     "charge_state_model"),
+        ("impurity_representation",     "charge_density"),
+        # Write the exact all-stage Zeff per radius into the transport-code inputs rather than
+        # letting them derive it from the single-species representation (high by Z_imp/<Z>).
+        ("impurity_zeff_override",      True),
         ("neutral_model",               "Null"),
         ("neutral_model_options",       {}),
         ("elm_model",                   "Null"),
@@ -161,6 +177,13 @@ class powerstate_edge(powerstate):
         target_options["options"].setdefault("target_evaluator_method", "powerstate_edge")
         target_options["options"].setdefault("targets_evolve", ["qie", "qrad", "qfus"])
         target_options["options"].setdefault("force_zero_particle_flux", False)
+        # Source convention for the tracked impurity (GZ channel). "auto" pairs it with the
+        # impurity representation -- "charge" for the default n_rep = sum_z z n_z / Z_imp, and
+        # "nuclei" for the conserved partition -- because the two must agree: the GZ target has
+        # to be the source of whatever density the codes were handed. An explicit "charge" or
+        # "nuclei" overrides the pairing. "auto" reproduces the previous default exactly on the
+        # default representation. See analytical_model_edge._evaluate_particle_fluxes.
+        target_options["options"].setdefault("impurity_source_convention", "auto")
         target_options["options"].setdefault("percent_error", 1.0)
         # ---------------------------------------------
 
@@ -361,6 +384,15 @@ class powerstate_edge(powerstate):
         self._bc_model_options     = opts.get("bc_model_options", {})
         self._cs_model_name        = opts.get("charge_state_model", "Null")
         self._cs_model_options     = opts.get("charge_state_model_options", {})
+        # How the charge-state ladder is collapsed onto the single GACODE impurity species.
+        #   "charge_density" (default) : n_rep = sum_z z n_z / Z_imp     -> first moment exact
+        #   "fully_stripped"           : n_rep = n_z(Z_imp)              -> legacy, archived runs
+        self._impurity_density_source  = opts.get("impurity_density_source", "charge_state_model")
+        self._impurity_representation = opts.get("impurity_representation", "charge_density")
+        # Write the exact all-stage Zeff into the transport-code inputs per radius, instead of
+        # letting them derive it from the single-species representation (which is high by
+        # Z_imp/<Z>). See _impurity_zeff_exact.
+        self._impurity_zeff_override = opts.get("impurity_zeff_override", True)
         self._neu_model_name       = opts.get("neutral_model", "Null")
         self._neu_model_options    = opts.get("neutral_model_options", {})
         self._elm_model_name       = opts.get("elm_model", "Null")
@@ -401,6 +433,8 @@ class powerstate_edge(powerstate):
             self.parameterizer = _parameterizers_mod.Mtanh(self._parameterizer_options)
         elif self._parameterizer_name in {"SplineMtanh", "spline_mtanh", "mtanh_spline", "MtanhSpline"}:
             self.parameterizer = _parameterizers_mod.SplineMtanh(self._parameterizer_options)
+        elif self._parameterizer_name in {"ClampedHermite", "clamped_hermite", "hermite"}:
+            self.parameterizer = _parameterizers_mod.ClampedHermite(self._parameterizer_options)
         elif self._parameterizer_name in {"SplineMtanhAnalytic", "spline_mtanh_analytic",
                                           "mtanh_spline_analytic", "MtanhSplineAnalytic"}:
             self.parameterizer = _parameterizers_mod.SplineMtanhAnalytic(self._parameterizer_options)
@@ -581,6 +615,174 @@ class powerstate_edge(powerstate):
         self._enforce_quasineutrality()
         self._refresh_density_scale_lengths()
 
+    def _impurity_Z(self):
+        """Nominal charge of the tracked impurity species, as a scalar or (batch,1) tensor."""
+        Zi = self.plasma.get("ions_set_Zi", None)
+        if Zi is None:
+            return None
+        imp = self.impurityPosition
+        if Zi.dim() == 2:
+            if not (0 <= imp < Zi.shape[-1]):
+                return None
+            return Zi[:, imp].unsqueeze(-1)
+        if not (0 <= imp < Zi.shape[0]):
+            return None
+        return Zi[imp]
+
+    def _representative_impurity_density(self, nz_all):
+        """Single-species stand-in for the full charge-state ladder, on the powerstate grid.
+
+        GACODE carries ONE charge per ion species (`# z`) and ``ions_set_Zi`` is
+        (batch, n_species) -- neither can hold a radially varying charge. So the impurity is
+        represented at its nominal charge ``Z_imp`` with a density chosen to preserve the
+        CHARGE density exactly:
+
+            n_rep(r) = ( sum_z z n_z(r) ) / Z_imp
+
+        Preserving the first moment is what quasineutrality, the main-ion density, the dilution
+        and the impurity gradient drive all depend on. The previous behaviour --
+        ``ni[..., imp] = nz_all[..., -1]``, the fully stripped stage alone -- preserves none of
+        them: across this domain the fully stripped fraction runs ~0.85 -> 0.17, so TGLF was
+        handed 17-85% of the actual impurity at full charge while quasineutrality and Zeff used
+        ``sum_z z^2 n_z`` over every stage. That mismatch is why plasma["Zeff"] and the generated
+        namelist ZEFF disagreed even after the nZ write-back was fixed.
+
+        The second moment is NOT preserved by this choice: species-derived
+        ``ZEFF = Z_imp sum_z z n_z / n_e`` overestimates ``sum_z z^2 n_z / n_e`` by
+        ``Z_imp/<Z>`` (~8% at roa 0.90, ~43% at the LCFS, on the impurity part only). It is
+        corrected separately by writing ZEFF per radius into the code inputs -- ZEFF is a scalar
+        plasma parameter rather than species metadata, so nothing desyncs.
+
+        ``impurity_representation = "fully_stripped"`` restores the legacy behaviour, for
+        reproducing archived runs only.
+        """
+        if str(getattr(self, "_impurity_representation", "charge_density")).lower() in (
+            "fully_stripped", "legacy", "last_stage",
+        ):
+            return nz_all[..., -1]
+
+        z = torch.arange(nz_all.shape[-1], dtype=nz_all.dtype, device=nz_all.device)
+        charge_dens = (nz_all * z).sum(dim=-1)          # sum_z z n_z  (batch, rho)
+
+        Z_imp = self._impurity_Z()
+        if Z_imp is None:
+            print(
+                "[powerstate_edge] ions_set_Zi unavailable; falling back to the fully stripped "
+                "stage for the impurity density. Zeff and quasineutrality will not agree with "
+                "the charge-state solution.",
+                typeMsg="w",
+            )
+            return nz_all[..., -1]
+
+        Z_imp = Z_imp.to(charge_dens) if torch.is_tensor(Z_imp) else Z_imp
+        return charge_dens / torch.as_tensor(Z_imp).to(charge_dens).clamp(min=1e-30)
+
+
+    def _impurity_zeff_exact(self):
+        """Exact Zeff = sum_s Z_s^2 n_s / n_e using ALL impurity charge states.
+
+        Returns (batch, rho) or None. This is the value the transport codes should be given
+        directly, because deriving Zeff from a single-species representation at fixed Z_imp
+        overestimates the impurity contribution by Z_imp/<Z>.
+        """
+        p = self.plasma
+        if ("ne" not in p) or ("ni" not in p) or ("ions_set_Zi" not in p):
+            return None
+        moments = self._impurity_charge_moments()
+        if moments is None:
+            return None
+        _, imp_z2 = moments
+
+        ni, ne, Zi = p["ni"], p["ne"], p["ions_set_Zi"]
+        Zi_b = Zi.unsqueeze(0).expand(ni.shape[0], -1) if Zi.dim() == 1 else Zi
+        imp = self.impurityPosition
+
+        # ni / ne / nz_all can sit on different radial grids depending on where in the
+        # calculate() sequence this is called (the edge fine/coarse interpolation touches
+        # only the keys in _EDGE_KEYS_*). Refuse to guess an alignment: emit the shapes and
+        # skip the override, so the codes derive ZEFF themselves rather than being handed a
+        # silently misaligned profile.
+        if ni.shape[1] != ne.shape[1] or imp_z2.shape[1] != ne.shape[1]:
+            print(
+                f"[powerstate_edge] Cannot build the exact Zeff: radial grids disagree "
+                f"(ne {tuple(ne.shape)}, ni {tuple(ni.shape)}, imp_z2 {tuple(imp_z2.shape)}). "
+                f"Skipping the ZEFF override.",
+                typeMsg="w",
+            )
+            return None
+
+        other_z2 = torch.zeros_like(ne)
+        for s in range(ni.shape[-1]):
+            if s == imp:
+                continue
+            other_z2 = other_z2 + (Zi_b[:, s].unsqueeze(-1) ** 2) * ni[..., s]
+
+        return torch.nan_to_num(
+            (other_z2 + imp_z2) / ne.clamp(min=1e-30),
+            nan=0.0, posinf=0.0, neginf=0.0,
+        )
+
+
+    def zeff_for_transport_inputs(self, rho_locations, batch_idx: int = 0):
+        """Exact all-stage Zeff sampled at the transport-code radii, or None.
+
+        Intended for a per-radius ``extraOptions["ZEFF"]`` override: ``SIMtools.modifyInputs``
+        indexes list-valued extraOptions by ``position_change``, which is the radius index, so a
+        list here lands one value per input file.
+
+        Why this is needed: the impurity reaches the codes as a single species at ``Z_imp`` with
+        ``n_rep = sum_z z n_z / Z_imp`` (see ``_representative_impurity_density``). That is exact
+        in the charge density but makes the species-derived ``ZEFF`` high by ``Z_imp/<Z>`` --
+        ~9% of (Zeff-1) at the pedestal top rising past 60% near the LCFS. ZEFF is a scalar
+        plasma parameter rather than species metadata, so overriding it corrects the second
+        moment without desyncing the species between input.gacode and the code inputs.
+
+        Returns ``None`` (leaving the code to derive ZEFF itself) when no real charge-state
+        solution exists, when the override is disabled, or when anything needed is missing --
+        in those cases the single-species representation is already exact.
+        """
+        if not bool(getattr(self, "_impurity_zeff_override", False)):
+            return None
+        if str(getattr(self, "_cs_model_name", "Null")).lower() in ("null", "none"):
+            return None
+        if "rho" not in self.plasma:
+            return None
+
+        # Prefer the value frozen by calculateChargeStates (grids guaranteed consistent there);
+        # fall back to recomputing only if it is absent.
+        zeff = self.plasma.get("Zeff_exact", None)
+        if zeff is None:
+            zeff = self._impurity_zeff_exact()
+        if zeff is None:
+            return None
+        if zeff.shape[1] != self.plasma["rho"].shape[1]:
+            print(
+                f"[powerstate_edge] Exact Zeff is on a {zeff.shape[1]}-point grid but rho has "
+                f"{self.plasma['rho'].shape[1]}; skipping the ZEFF override rather than "
+                f"interpolating across a grid mismatch.",
+                typeMsg="w",
+            )
+            return None
+
+        b = int(batch_idx)
+        if not (0 <= b < zeff.shape[0]):
+            return None
+
+        rho_ps = self.plasma["rho"][b, :].detach().cpu().numpy()
+        zeff_ps = zeff[b, :].detach().cpu().numpy()
+        order = np.argsort(rho_ps)
+        vals = np.interp(np.asarray(rho_locations, dtype=float), rho_ps[order], zeff_ps[order])
+
+        if not np.all(np.isfinite(vals)) or np.any(vals < 1.0):
+            print(
+                f"[powerstate_edge] Exact Zeff at the transport radii is not usable "
+                f"(min={np.nanmin(vals):.3f}); leaving ZEFF to be derived from the species.",
+                typeMsg="w",
+            )
+            return None
+
+        return [float(v) for v in vals]
+
     def _impurity_charge_moments(self):
         """Impurity charge density Σ_z z·n_z and Σ_z z²·n_z, generalized over the
         number of charge states.
@@ -699,7 +901,13 @@ class powerstate_edge(powerstate):
         elif "nZ" in self.plasma:
             tracked_imp = self.plasma["nZ"]
 
-        if "aLnZ" in self.plasma and tracked_imp is not None:
+        # When nZ is predicted the parameterizer owns aLnZ ANALYTICALLY. Recomputing it here by
+        # finite difference would silently replace the DV's own gradient with a numerically
+        # different one, so the residual would be reported against a profile the optimizer did
+        # not propose. Leave it alone; ion scale lengths below are still refreshed.
+        if ("aLnZ" in self.plasma
+                and tracked_imp is not None
+                and "nZ" not in self.predicted_channels):
             nz_np = torch.nan_to_num(
                 tracked_imp,
                 nan=0.0,
@@ -1250,8 +1458,63 @@ class powerstate_edge(powerstate):
         for b in range(batch):
             model.solve(self, batch_idx=b)
 
-        # Unpack charge-state distribution into tracked impurity and main-ion channels.
-        # nz_all[..., -1] = fully ionized impurity; Σ_z z*nz_all gives impurity charge density.
+        # ── D2: when nZ is a PREDICTED channel, the DV owns the impurity density ──────────
+        #
+        # Previously the unpack below ran whenever a charge-state model was active, gated only
+        # on `_cs_model_name != Null` and never on whether nZ was predicted. So modify(X) set
+        # ni[..., imp] from the DV and this immediately overwrote it: the degree of freedom was
+        # inert, the residual barely responded, and the optimizer searched a flat direction.
+        #
+        # The fix is NOT to skip the unpack. Skipping it would leave nz_all -- and therefore
+        # the radiation, the ionization sources and Zeff -- describing a different impurity
+        # density than the one handed to the transport codes. Instead, renormalize the ladder
+        # onto the predicted density. Aurora then owns only the charge-state FRACTIONS while
+        # the flux-match owns the TOTAL, which is the decomposition this model wants anyway,
+        # and the unpack below becomes self-consistently a no-op.
+        # The same renormalization serves a second, non-DV case: impurity_density_source =
+        # "prescribed". There the impurity density is whatever modify() left in
+        # ni[..., imp] -- i.e. the INITIAL profile's f_Z carried along with ne by
+        # scaleIonDensities -- and Aurora's steady-state solve does NOT own it. With
+        # enforce_same_aLn=True that gives f_Z = const * ne, hence a/L_nZ = a/L_ne exactly,
+        # while radiation, qpar_wall/qpar_imp, qpar_Z and Zeff still come from a real Aurora
+        # ladder evaluated ON that density. That is the configuration the "Null" charge-state
+        # model could not provide: it switches the atomic physics off entirely.
+        #
+        # NOTE the amplitude anchor changes with it. In "charge_state_model" mode the level is
+        # set by prep_calibrated driving source_rate to the LCFS Z_eff; in "prescribed" mode
+        # source_rate no longer sets the level at all -- the input profile's f_Z does, and the
+        # calibration step becomes inert. State which anchor a run used when reporting it.
+        _dv_owns = "nZ" in self.predicted_channels
+        _prescribed = str(getattr(self, "_impurity_density_source", "charge_state_model")).lower() \
+            in ("prescribed", "experimental", "initial")
+
+        if (
+            (_dv_owns or _prescribed)
+            and str(self._cs_model_name).lower() not in ("null", "none")
+            and "nz_all" in self.plasma
+            and "ni" in self.plasma
+        ):
+            if _dv_owns and "nZ" in self.plasma:
+                target = self.plasma["nZ"]
+                why = "nZ is predicted: rescaled nz_all onto the DV density"
+            elif self.impurityPosition < self.plasma["ni"].shape[-1]:
+                target = self.plasma["ni"][..., self.impurityPosition]
+                why = ("impurity_density_source='prescribed': rescaled nz_all onto the "
+                       "profile density")
+            else:
+                target = None
+
+            if target is not None:
+                nz_all_pre = self.plasma["nz_all"]
+                rep_now = self._representative_impurity_density(nz_all_pre)
+                scale = target / rep_now.clamp(min=1e-30)
+                scale = torch.nan_to_num(scale, nan=1.0, posinf=1.0, neginf=1.0).clamp(min=0.0)
+                self.plasma["nz_all"] = nz_all_pre * scale.unsqueeze(-1)
+                print(f"\t- [powerstate_edge] {why} (factor "
+                      f"{scale.min().item():.3g}-{scale.max().item():.3g}); Aurora keeps the "
+                      f"charge-state fractions only", typeMsg="i")
+
+        # Unpack the charge-state distribution into the tracked impurity channel.
         # Only a REAL solution may be unpacked: NullChargeStates writes nz_all = 0 as a
         # placeholder, which would zero the experimental impurity, hand all of ne to the main
         # ion and drive Zeff -> 1 -- silently, since quasineutrality still closes on that state.
@@ -1267,13 +1530,13 @@ class powerstate_edge(powerstate):
 
             if self.impurityPosition < ni.shape[-1]:
                 ni[..., self.impurityPosition] = torch.nan_to_num(
-                    nz_all[..., -1],
+                    self._representative_impurity_density(nz_all),
                     nan=0.0,
                     posinf=0.0,
                     neginf=0.0,
                 ).clamp(min=0.0)
 
-            # Keep nZ synchronized to the tracked fully ionized impurity channel.
+            # Keep nZ synchronized to the tracked impurity channel.
             if "nZ" in self.plasma and self.impurityPosition < ni.shape[-1]:
                 self.plasma["nZ"] = ni[..., self.impurityPosition]
 
@@ -1283,6 +1546,15 @@ class powerstate_edge(powerstate):
         # always taken from the same source.
         self._main_ion_index = int(getattr(model, "main_ion_species_index", 0))
         self._enforce_quasineutrality()
+
+        # Freeze the exact all-stage Zeff HERE, where ni / ne / nz_all are known to share a
+        # grid (quasineutrality just closed on them). By the time the transport models run,
+        # ni and nz_all can carry one fewer radial point than ne, and reconstructing the
+        # second moment there would mean guessing an alignment. Stored so
+        # zeff_for_transport_inputs only has to interpolate.
+        _zeff_exact = self._impurity_zeff_exact()
+        if _zeff_exact is not None:
+            self.plasma["Zeff_exact"] = _zeff_exact
 
         # Keep impurity fraction consistent with updated impurity densities.
         if "ne" in self.plasma:
@@ -1561,6 +1833,15 @@ class powerstate_edge(powerstate):
         rho_cp = self.rhoCP.detach().cpu().numpy()
         rho_fine = self.plasma["rho"][0, :].detach().cpu().numpy()
 
+        # A single control point carries no radial information: interp1d cannot form a
+        # slope from one sample and silently returns all-NaN (invalid divide), which
+        # propagates into every *_tr array and then into the residual. Broadcast the
+        # single value across the fine grid instead.
+        def _lift_1d(values, x_src=rho_cp, x_dst=rho_fine):
+            if len(values) < 2:
+                return np.full_like(x_dst, values[0], dtype=float)
+            return interp1d(x_src, values, fill_value="extrapolate")(x_dst)
+
         for key, val in proxy_plasma.items():
             if key_filter and key_filter not in key:
                 continue
@@ -1573,16 +1854,7 @@ class powerstate_edge(powerstate):
                 has_prepended_zero = val.shape[1] == (n_cp + 1)
                 lifted = np.stack(
                     [
-                        interp1d(
-                            rho_cp,
-                            v_np[b, 1:] if has_prepended_zero else v_np[b, :],
-                            fill_value="extrapolate",
-                        )(rho_fine)
-                        # interpolation_function(
-                        #     rho_fine,
-                        #     rho_cp,
-                        #     v_np[b, 1:] if has_prepended_zero else v_np[b, :],
-                        # )
+                        _lift_1d(v_np[b, 1:] if has_prepended_zero else v_np[b, :])
                         for b in range(batch)
                     ]
                 )
@@ -1596,7 +1868,7 @@ class powerstate_edge(powerstate):
                 lifted = np.stack(
                     [
                         np.stack(
-                            [interp1d(rho_cp, vals[b, :, i], fill_value="extrapolate")(rho_fine) for i in range(d)],
+                            [_lift_1d(vals[b, :, i]) for i in range(d)],
                             axis=-1,
                         )
                         for b in range(batch)

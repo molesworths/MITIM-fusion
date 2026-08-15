@@ -183,7 +183,55 @@ class AuroraChargeStates(ChargeStateModel):
         self.main_ion_species_index = options.get("main_ion_species_index",   0)
         self.verbose         = options.get("verbose",         False)
 
+        # Impurity peaking factor a/L_nZ as the model input, in place of V_z_m_s.
+        # Accepts a scalar (uniform), or an (x, y) pair of arrays with x = r/r_lcfs.
+        # See _transport_coefficients for why this is the physical parameterization.
+        self._aLnZ_target = self._parse_aLnZ(options.get("aLnZ_profile", None))
+
+        # Unrecognized keys are silently ignored by options.get(), so a misspelled
+        # knob reads as "this input has no effect" rather than as an error. That is
+        # exactly how "V0_m_s" (correct key: "V_z_m_s") sat unnoticed in workflows --
+        # every run used the -0.5 default and a V_z scan produced bit-identical output.
+        _known = {
+            "imp", "main_element", "D_z_m2_s", "V_z_m_s", "source_rate", "cxr_flag",
+            "max_dilution_fraction", "max_source_rate_iters",
+            "update_ni_charge_balance", "main_ion_species_index", "verbose",
+            "aLnZ_profile",
+        }
+        _unknown = set(options) - _known
+        if _unknown:
+            _hint = {"V0_m_s": "V_z_m_s", "D_z": "D_z_m2_s", "V_z": "V_z_m_s"}
+            for k in sorted(_unknown):
+                sug = _hint.get(k)
+                print(f"\t- [AuroraChargeStates] option '{k}' is not recognized and "
+                      f"has NO effect"
+                      + (f" -- did you mean '{sug}'?" if sug else ""),
+                      typeMsg="w")
+
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_aLnZ(spec):
+        """Normalize an ``aLnZ_profile`` spec to an (x, y) pair on x = r/r_lcfs, or None.
+
+        Accepts None (use the legacy V ramp), a scalar (uniform peaking), or any
+        (x, y) sequence pair. A scalar is stored on a two-point grid so the same
+        interpolation path handles both.
+        """
+        if spec is None:
+            return None
+        if np.isscalar(spec):
+            return (np.array([0.0, 1.5]), np.array([float(spec), float(spec)]))
+        x, y = spec
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if x.shape != y.shape or x.ndim != 1 or x.size < 2:
+            raise ValueError(
+                f"aLnZ_profile must be a scalar or a matching (x, y) pair of 1-D arrays; "
+                f"got shapes {x.shape} and {y.shape}."
+            )
+        order = np.argsort(x)
+        return (x[order], y[order])
 
     def _build_namelist(self, powerstate, b: int, source_rate: float = None) -> dict:
         """Construct a minimal Aurora namelist from powerstate tensors."""
@@ -266,11 +314,42 @@ class AuroraChargeStates(ChargeStateModel):
         return nml
 
     def _transport_coefficients(self, asim) -> tuple:
-        """Return (D_z, V_z) arrays on Aurora's rvol_grid."""
+        """Return (D_z, V_z) arrays on Aurora's rvol_grid.
+
+        Two modes:
+
+        *Peaking-prescribed* (``aLnZ_profile`` set) -- the physical parameterization. The 1-D
+        flux-surface-averaged balance ``Gamma_Z = -D dn/dr + V n`` fixes only the RATIO wherever
+        the enclosed impurity source is negligible:  ``a/L_nZ = -a V/D``. So the model input is
+        the peaking factor and the pinch follows from it,
+
+            V(r) = -D (a/L_nZ)(r) / a
+
+        which enforces the analytic relation pointwise. ``D_z_m2_s`` then affects only the
+        ionization balance and the near-LCFS source region, not the density shape. This is what
+        makes both signs reachable: hollow impurity profiles (a/L_nZ < 0) occur in the flat-top
+        region of the H-mode cases and cannot be represented by a one-signed linear ramp.
+
+        *Legacy ramp* (``aLnZ_profile`` unset) -- uniform D with ``V(r) = V0 r/r_lcfs``, which
+        yields ``a/L_nZ = (a V0/D)(r/r_lcfs)``: single-signed and varying by only ~15% across
+        the edge domain, so it cannot produce an impurity pedestal. Kept for reproducing
+        archived runs.
+        """
         nr       = len(asim.rvol_grid)
         nZ_plus1 = asim.Z_imp + 1         # includes neutral
 
         D_z = self.D0 * 1e4 * np.ones((nr, nZ_plus1))   # m²/s → cm²/s
+
+        if self._aLnZ_target is not None:
+            # a/L_nZ supplied on normalized radius r/r_lcfs; map onto Aurora's grid.
+            x_t, y_t = self._aLnZ_target
+            x_a = asim.rvol_grid / max(asim.rvol_lcfs, 1e-10)
+            aLnZ = np.interp(x_a, x_t, y_t)
+            a_cm = max(asim.rvol_lcfs, 1e-10)          # minor radius in Aurora's units [cm]
+            v = -(self.D0 * 1e4) * aLnZ / a_cm         # cm/s, sign follows a/L_nZ
+            V_z = v[:, None] * np.ones((1, nZ_plus1))
+            return D_z, V_z
+
         # Linearly increasing inward pinch from axis to LCFS
         v_ramp   = self.V0 * 100.0 * asim.rvol_grid / max(asim.rvol_lcfs, 1e-6)  # m/s → cm/s
         V_z = v_ramp[:, None] * np.ones((1, nZ_plus1))

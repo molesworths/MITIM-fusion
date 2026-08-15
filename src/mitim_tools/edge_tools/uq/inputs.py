@@ -182,8 +182,14 @@ class UQInputs:
         self.add_source("impurity_D", rel_sigma,
                         option_target="cs", option_key=option_key, space="log")
 
-    def add_impurity_V(self, rel_sigma: float, option_key: str = "V0_m_s"):
-        """Impurity convection V0 (sign-changing -> LINEAR space)."""
+    def add_impurity_V(self, rel_sigma: float, option_key: str = "V_z_m_s"):
+        """Impurity convection V_z (sign-changing -> LINEAR space).
+
+        Key must match AuroraChargeStates, which reads options["V_z_m_s"]. The
+        previous default here was "V0_m_s", which nothing reads: the perturbation
+        was applied to a key the charge-state model ignores, so this UQ dimension
+        contributed exactly zero variance.
+        """
         self.add_source("impurity_V", rel_sigma,
                         option_target="cs", option_key=option_key, space="linear")
 

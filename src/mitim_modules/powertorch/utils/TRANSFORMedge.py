@@ -335,8 +335,21 @@ def powerstate_to_gacode(
             profiles.profiles["z_eff(-)"] = zeff_gacode
             profiles.derived["Zeff"] = zeff_gacode
 
+    # nZ is normally inserted only when it is a predicted channel. But when a
+    # charge-state model is active it OWNS the impurity density: calculateChargeStates
+    # writes the Aurora solution into plasma["ni"][..., impurityPosition] and closes
+    # quasineutrality on it. Gating its write-back on predicted_channels stranded that
+    # solution in the powerstate -- the impurity density in input.gacode stayed at the
+    # initial profile (merely rescaled with ne by ni_thermals below, so the impurity
+    # FRACTION never moved), and TGLF derives ZEFF from those species densities. Net
+    # effect: a 16x impurity-source swing moved plasma["Zeff"] 1.01 -> 2.49 while the
+    # generated namelist held ZEFF=1.31228 and AS_3=1.04093E-02 exactly.
+    # nZ sits after ne in `quantities`, so it is inserted AFTER the ne rescale and is
+    # not clobbered by it.
+    _cs_active = str(getattr(self, "_cs_model_name", "Null")).lower() not in ("null", "none")
+
     for key in quantities:
-        if key[0] in self.predicted_channels:
+        if key[0] in self.predicted_channels or (key[0] == "nZ" and _cs_active):
             print(f"\t- Inserting {key[0]} into input.gacode profiles")
 
             y_ps = self.plasma[key[0]][position_in_powerstate_batch, :].cpu().numpy()
@@ -368,6 +381,15 @@ def powerstate_to_gacode(
                 scaleFactor = y_new / Y_copy
                 print("\t\t* Adjusting ni of thermal ions", typeMsg="i")
                 profiles.scaleAllThermalDensities(scaleFactor=scaleFactor)
+
+    # Inserting nZ on the charge-state path changes ONE ion density without touching
+    # the main ion, which leaves the gacode file quasineutral-violating (the ne rescale
+    # above preserved QN only because it scaled every thermal ion together). The
+    # powerstate is already closed by _enforce_quasineutrality; re-close the gacode copy
+    # on the main ion so TGLF sees the same closed state rather than an ne deficit.
+    if _cs_active and "nZ" not in self.predicted_channels:
+        profiles.derive_quantities(rederiveGeometry=False)
+        profiles.enforceQuasineutrality()
 
     if "w0" not in self.predicted_channels and force_mach is not None:
         # Rotation fixed to ensure Mach number

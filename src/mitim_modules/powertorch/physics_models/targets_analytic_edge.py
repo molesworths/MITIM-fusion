@@ -53,7 +53,7 @@ from mitim_tools.misc_tools.LOGtools import printMsg as print
 
 
 # Edge-specific plasma keys that require grid interpolation
-_EDGE_KEYS_2D = ("n0", "tau_n0", "S_ion_main", "nu_ioniz_main", "qrad_aurora", "qiziz_loss")
+_EDGE_KEYS_2D = ("n0", "tau_n0", "S_ion_main", "nu_ioniz_main", "qrad_aurora", "qiziz_loss", "Zeff_exact")
 _EDGE_KEYS_3D = ("nz_all", "nu_scd_imp", "nu_acd_imp")
 
 
@@ -157,8 +157,9 @@ class analytical_model_edge(analytical_model):
           - Zeros the TGYRO Chebyshev contribution for the Aurora-tracked impurity,
             calls base ``_evaluate_radiation()``, restores coefficients, adds
             ``qrad_aurora``, and adds Aurora H/D neutral radiation.
-    2.  ``_evaluate_particle_fluxes()`` — D⁰ ionisation source + impurity net
-        electron source (trace-regime only).
+    2.  ``_evaluate_particle_fluxes()`` — D⁰ ionisation source, impurity net electron
+        source (exact by charge conservation; NOT restricted to the trace regime), and
+        the tracked-impurity source ``qpar_Z``.
     3.  ``_evaluate_ionization_loss()`` — ionisation energy cost from qie.
     """
 
@@ -379,8 +380,13 @@ class analytical_model_edge(analytical_model):
             ``max(Σ z·nz / ne)`` is only checked against
             ``impurity_dilution_warn`` (default 0.5) to warn when the
             quasineutrality-based ``ni`` reconstruction is being stressed.
-        3.  **Fully ionised impurity source** — net source for the fully
-            stripped stage only, used for ``GZ`` coupling.
+        3.  **Tracked-impurity source (``qpar_Z``, the GZ target)** — the source of
+            whichever impurity quantity was handed to the transport codes, selected by
+            ``impurity_source_convention``: ``"charge"`` (default) for the
+            charge-weighted representative density, ``"nuclei"`` for impurity nuclei.
+            NOT the fully-stripped-stage source, which is what this used to be and is
+            neither. Measured on the L case, the charge convention puts ``GZ_target`` at
+            8-44% of the impurity transport flux, so it is NOT negligible.
 
         Unit accounting
         ---------------
@@ -406,9 +412,13 @@ class analytical_model_edge(analytical_model):
                 # Fallback to Voronov (1997) H ionization fit, consistent with neutrals.py.
                 U = 13.6 / Te_eV.clamp(0.1)
                 sigma_v = 2.91e-14 * (U ** 0.39) * torch.exp(-U) / (0.232 + U)  # m^3/s
-                # n0/ne in [1e19 m^-3] => product is [1e38 m^-6]; multiply by sigma_v and
-                # by 1e-19 to return [1e19 m^-3 s^-1].
-                S_ion = n0_1e19 * ne_1e19 * sigma_v * 1e-19
+                # n0 and ne are stored as multiples of 1e19 m^-3, so the physical product
+                # carries 1e38: rate = (n0*1e19)(ne*1e19)*sigma_v [m^-3 s^-1]. Returning that
+                # in the same 1e19-based units divides by 1e19, leaving a NET FACTOR OF +1e19.
+                # This previously read 1e-19, i.e. 1e38 too small -- which would silently zero
+                # the main-ion particle source, and with it most of the Ge target, whenever
+                # S_ion_main was unavailable. Only reachable via this fallback, which warns.
+                S_ion = n0_1e19 * ne_1e19 * sigma_v * 1e19
                 print(
                     "[analytical_model_edge] Using fallback S_ion estimate because S_ion_main is missing.",
                     typeMsg="w",
@@ -444,11 +454,61 @@ class analytical_model_edge(analytical_model):
 
             p["qpar_imp"] = p["qpar_imp"] + S_imp_net * 0.1
 
-            # Fully stripped impurity stage (charge Z):
-            # source from ionisation into Z minus recombination out of Z.
-            # scd[..., -2] drives (Z-1 -> Z), acd[..., -1] drives (Z -> Z-1).
+            # ── Source for the TRACKED impurity species (the GZ channel) ────────
+            #
+            # The tracked species is whatever calculateChargeStates handed the transport
+            # codes, so its source has to be the source of THAT quantity. The previous
+            # expression, scd[-2]nz[-2] - acd[-1]nz[-1], is the net source into the fully
+            # stripped stage alone -- neither an impurity particle source nor the source of
+            # the charge-weighted density. It is one arbitrary term of the charge sum, and
+            # with <Z> falling 5.8 -> 4.2 across this domain it is dominated by carbon
+            # redistributing between stages as it crosses the Te gradient.
+            #
+            # Two physically meaningful conventions, selected by
+            # target_options["options"]["impurity_source_convention"]:
+            #
+            #  "charge"  (default) -- matches the D1 representation
+            #        n_rep = sum_z z n_z / Z_imp, so Q = Z_imp n_rep and the single-species
+            #        approximation gives  div(Gamma_rep) = S_Q / Z_imp  with S_Q the net
+            #        electron-liberation rate. NOTE this is NOT small: an impurity flowing
+            #        inward through a rising Te keeps ionizing, so the charge-weighted
+            #        density has a genuine volumetric source. Do not assume GZ_target ~ 0.
+            #
+            #  "nuclei" -- the tracked species is impurity NUCLEI, sum_z n_z, a conserved
+            #        quantity whose only source is ionization out of the neutral stage.
+            #        Small in the interior (most impurity ionizes in the SOL). Consistent
+            #        only if the species density handed to the codes is sum_z n_z, which it
+            #        is NOT under the default representation -- so this is for testing the
+            #        sensitivity of GZ to the convention, not for production.
             if nZ_plus1 >= 2:
-                S_Z = scd[:, :, -2] * nz[:, :, -2] - acd[:, :, -1] * nz[:, :, -1]
+                convention = str(self.powerstate.target_options["options"].get(
+                    "impurity_source_convention", "auto")).lower()
+                if convention == "auto":
+                    # Pair the target with the representation: the GZ target must be the source
+                    # of whichever density the codes were actually handed. A conserved partition
+                    # density has only the nuclei source; the charge-weighted n_rep has S_Q/Z_imp.
+                    rep = str(getattr(self.powerstate, "_impurity_representation",
+                                      "charge_density")).lower()
+                    convention = ("nuclei" if rep in ("partition", "conserved", "nuclei")
+                                  else "charge")
+                Z_imp = self.powerstate._impurity_Z() if hasattr(
+                    self.powerstate, "_impurity_Z") else None
+
+                if str(convention).lower() == "nuclei":
+                    S_Z = scd[:, :, 0] * nz[:, :, 0] - acd[:, :, 1] * nz[:, :, 1]
+                elif Z_imp is None:
+                    print(
+                        "[analytical_model_edge] impurity_source_convention='charge' needs the "
+                        "impurity charge, which is unavailable; falling back to the nuclei "
+                        "source for qpar_Z.",
+                        typeMsg="w",
+                    )
+                    S_Z = scd[:, :, 0] * nz[:, :, 0] - acd[:, :, 1] * nz[:, :, 1]
+                else:
+                    Zt = Z_imp.to(S_imp_net) if torch.is_tensor(Z_imp) else torch.as_tensor(
+                        Z_imp, dtype=S_imp_net.dtype, device=S_imp_net.device)
+                    S_Z = S_imp_net / Zt.clamp(min=1e-30)
+
                 p["qpar_Z"] = p["qpar_Z"] + S_Z * 0.1
 
             # Diagnostic only: the electron source above is unconditional; this

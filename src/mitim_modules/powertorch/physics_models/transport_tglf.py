@@ -52,6 +52,19 @@ class tglf_model:
         # Run TGLF (base)
         # ------------------------------------------------------------------------------------------------------------------------
 
+        # Per-radius ZEFF override. The impurity reaches TGLF as one species at Z_imp carrying
+        # the exact CHARGE density, which leaves the species-derived ZEFF high by Z_imp/<Z>.
+        # ZEFF is a scalar plasma parameter, so overriding it fixes the second moment without
+        # desyncing the species between input.gacode and input.tglf. No-op unless a charge-state
+        # model is active and edge_options["impurity_zeff_override"] is on.
+        run_kwargs = dict(simulation_options["run"])
+        _zeff_fun = getattr(self.powerstate, "zeff_for_transport_inputs", None)
+        _zeff = _zeff_fun(rho_locations) if callable(_zeff_fun) else None
+        if _zeff is not None:
+            run_kwargs["extraOptions"] = {**(run_kwargs.get("extraOptions") or {}), "ZEFF": _zeff}
+            print(f"\t- Overriding TGLF ZEFF per radius with the all-stage value: "
+                  f"{[f'{v:.4f}' for v in _zeff]}", typeMsg="i")
+
         tglf.run(
             'base_tglf',
             ApplyCorrections=False,
@@ -64,7 +77,7 @@ class tglf_model:
                 },
             attempts_execution=2,
             only_minimal_files=keep_tglf_files in ['none'],
-            **simulation_options["run"]
+            **run_kwargs
         )
     
         tglf.read(
@@ -122,7 +135,10 @@ class tglf_model:
                 Qi_includes_fast=Qi_includes_fast,
                 only_minimal_files=keep_tglf_files in ['none', 'base'],
                 reuse_scan_ball_file=reuse_scan_ball_file,
-                **simulation_options["run"]
+                # run_kwargs, not simulation_options["run"]: the scan must carry the same
+                # per-radius ZEFF override as the base run, or the uncertainty is estimated
+                # around a different plasma than the one that produced Flux_base.
+                **run_kwargs
                 )
 
         self._raise_warnings(tglf, rho_locations, Qi_includes_fast)
