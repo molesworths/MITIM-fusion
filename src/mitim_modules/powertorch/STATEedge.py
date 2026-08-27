@@ -1701,7 +1701,7 @@ class powerstate_edge(powerstate):
 
         for b in range(batch):
             model.solve(self, batch_idx=b)
-            elm_factor_batch[b, :]  = model.elm_factor.to(elm_factor_batch)
+            elm_factor_batch[b, :]  = model.elm_factor
             alpha_MHD_batch[b, :]   = model.alpha_MHD.to(elm_factor_batch)
             alpha_crit_batch[b, :]  = model.alpha_crit.to(elm_factor_batch)
             unstable_batch[b, :]    = model.in_elm_region.to(elm_factor_batch)
@@ -1718,39 +1718,25 @@ class powerstate_edge(powerstate):
 
         f = elm_factor_batch   # (batch, rho)
 
-        # ── Scale turbulent heat/momentum flux components ─────────────────────
+        # ── Scale heat/momentum flux components ─────────────────────
         # Keys that map directly to (batch, rho) arrays
-        _heat_momentum_turb = [
-            "QeMWm2_tr_turb",
-            "QiMWm2_tr_turb",
-            "MtJm2_tr_turb",
+        _heat_momentum = [
+            "QeMWm2_tr",
+            "QiMWm2_tr",
+            "MtJm2_tr",
         ]
-        for key in _heat_momentum_turb:
+        for key in _heat_momentum:
             if key in self.plasma:
                 self.plasma[key] = self.plasma[key] * f
 
         # ── Scale turbulent particle flux components ──────────────────────────
-        _particle_turb = [
-            "Ge1E20m2_tr_turb",
-            "GZ1E20m2_tr_turb",
+        _particle = [
+            "Ge1E20m2_tr",
+            "GZ1E20m2_tr",
         ]
-        for key in _particle_turb:
+        for key in _particle:
             if key in self.plasma:
                 self.plasma[key] = self.plasma[key] * f
-
-        # ── Recompute total fluxes (turb + neoc) ──────────────────────────────
-        _total_map = [
-            ("QeMWm2_tr_turb",   "QeMWm2_tr_neoc",   "QeMWm2_tr"),
-            ("QiMWm2_tr_turb",   "QiMWm2_tr_neoc",   "QiMWm2_tr"),
-            ("Ge1E20m2_tr_turb", "Ge1E20m2_tr_neoc", "Ge1E20m2_tr"),
-            ("GZ1E20m2_tr_turb", "GZ1E20m2_tr_neoc", "GZ1E20m2_tr"),
-            ("MtJm2_tr_turb",    "MtJm2_tr_neoc",    "MtJm2_tr"),
-        ]
-        for turb_key, neoc_key, total_key in _total_map:
-            if turb_key in self.plasma and neoc_key in self.plasma:
-                self.plasma[total_key] = (
-                    self.plasma[turb_key] + self.plasma[neoc_key]
-                )
 
         # ── Recompute convective particle flux wrappers ───────────────────────
         # Ce_tr  = (3/2) * Te[J] * Ge1E20m2_tr [1e20/m^2/s]  (in MW/m^2)
@@ -2235,7 +2221,7 @@ class powerstate_edge(powerstate):
             nonlocality.calculateNonlocal(self, IOtools.expandPath(folder),
                                           self._nonlocal_options)
 
-        # 6. ELM peeling-ballooning penalty → inflates turbulent fluxes if unstable
+        # 6. ELM peeling-ballooning penalty → inflates fluxes if unstable
         self.calculateElm() # EPED-NN?
 
         # 7. Residual powers

@@ -1,0 +1,425 @@
+# (**************************************************************************************************************)
+#
+# PORTALS-E(dge) — complete, annotated namelist template.
+#
+# Every key below is shown at its CODE DEFAULT unless marked "[edge preset]", in which case the
+# value differs from the core-PORTALS default because it is the sensible edge choice. Nothing here
+# is required: `portals_edge` runs with an absent `edge_options` block (it then behaves as core
+# PORTALS on a trimmed domain).
+#
+#     from mitim_modules.portals.PORTALSedge import portals_edge
+#     portals_fun = portals_edge(folder, portals_namelist=".../namelist.portals_edge.yaml")
+#     portals_fun.portals_parameters["edge_options"]["neutral_model"] = "Analytic"   # or edit in-script
+#     portals_fun.prep(plasma_state); STRATEGYtools.MITIM_BO(portals_fun).run()
+#
+# The whole YAML becomes `portals_fun.portals_parameters`, so any key can equivalently be set from
+# the launch script *before* prep(). See README_PORTALSedge.md for what each option does physically.
+#
+# Units follow the powerstate convention: te/ti in keV, ne in 1e19 m^-3, aLy dimensionless.
+#
+# (**************************************************************************************************************)
+
+# -----------------------------------------------------------------
+# Main solver parameters
+# -----------------------------------------------------------------
+
+solution:
+
+  # Radial control points. predicted_roa wins if both are given; edge runs specify r/a.
+  predicted_roa: [0.88, 0.91, 0.94, 0.97]      # [edge preset]
+  predicted_rho: null
+
+  # Channels to predict. "nZ" hands the impurity DENSITY to the optimizer (adds one DV per knot
+  # and the GZ/CZ residual); see edge_options.impurity_density_source.
+  predicted_channels: ["te", "ti", "ne"]
+
+  # Profile parameterizer (DV control points -> full profile).
+  #   "spline"           : piecewise/akima spline on the control points
+  #                        (for Akima use "spline" + parameterizer_options.spline_type: "akima";
+  #                         the bare name "akima" is NOT accepted by powerstate_edge)
+  #   "mtanh"            : true global mtanh, DVs = [log_A, log_u1, delta, m]
+  #   "SplineMtanh"      : mtanh backbone + linear corrector pinning interior aLy knots
+  #                        (alias of SplineMtanhAnalytic; aLy-only). [edge preset]
+  #   "ClampedHermite"   : clamped Hermite on aLy knots
+  parameterizer: "SplineMtanh"                 # [edge preset]
+
+  # Forwarded verbatim to the parameterizer constructor. Keys below are the SplineMtanh ones that
+  # matter most; the full list lives in physics_models/parameterizers.py (SplineMtanhAnalytic).
+  parameterizer_options:
+    knots: [0.88, 0.91, 0.94, 0.97]   # default: predicted_roa. Reach the pedestal gradient peak.
+    defined_on: "aLy"                 # SplineMtanh accepts "aLy" only
+    # x0: 0.85                        # inner edge of the mtanh fit domain
+    # lam_r: 0.3                      # weak L2 on the width-asymmetry; keeps <4-knot fits unique
+    # use_corrector: true             # linear corrector that pins the interior knots exactly
+    # fit_seeds: 2                    # deterministic c-seed sweep (no warm start, no cache)
+    # fit_peak_extrap: true           # slope-extrapolation cap on the sub-separatrix aLy peak
+
+  turbulent_exchange_as_surrogate: true        # [edge preset]
+
+  trace_impurity: null
+
+  exploration_ranges:
+
+    # false => ymin/ymax are ABSOLUTE aLy bounds (recommended at the edge, where the pedestal
+    # gradient spans ~0-80 and a relative box around the initial guess censors the solution set).
+    limits_are_relative: false                 # [edge preset]
+
+    ymin:
+      te: [0.0, 0.0, 0.0, 0.0]
+      ti: [0.0, 0.0, 0.0, 0.0]
+      ne: [0.0, 0.0, 0.0, 0.0]
+    ymax:
+      te: [10.0, 20.0, 40.0, 80.0]
+      ti: [10.0, 20.0, 40.0, 80.0]
+      ne: [10.0, 20.0, 40.0, 80.0]
+
+    yminymax_atleast: null
+    enforce_finite_aLT: null
+    define_ranges_from_profiles: null          # NOT supported in edge mode; must stay null
+    start_from_folder: null
+    reevaluate_targets: 0
+    fixed_gradients: null
+
+  keep_full_model_folder: true
+  impurity_trick: true
+  fZ0_as_weight: null
+  fImp_orig: 1.0
+  scalar_multipliers: [1.0, 1.0, 1.0, 1.0, 1.0]
+
+  portals_transformation_variables:
+    10: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0]}
+    100: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0]}
+    10000: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], beta_e: [te, ne]}
+
+  portals_transformation_variables_trace:
+    10: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], aLnZ: [aLnZ]}
+    100: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], aLnZ: [aLnZ]}
+    10000: {aLte: [aLte], aLti: [aLti], aLne: [aLne], aLw0_n: [aLw0], nuei: [te, ne], tite: [te, ti], w0_n: [w0], beta_e: [te, ne], aLnZ: [aLnZ]}
+
+# -----------------------------------------------------------------
+# Transport model parameters
+# -----------------------------------------------------------------
+
+transport:
+
+  evaluator: "import::mitim_modules.powertorch.utils.TRANSPORTtools.portals_transport_model"
+
+  evaluator_instance_attributes:
+    turbulence_model: "tglf"
+    neoclassical_model: "neo"
+
+  options:
+
+    tglf:
+      run:
+        # "edge" preset = SAT_RULE 3, UNITS CGYRO, KYGRID_MODEL 4, XNU_MODEL 4, ALPHA_E 1,
+        # ALPHA_ZF -1 (activates the SAT3 low-k cutoff), ALPHA_P/ALPHA_MACH 0, EM (BPER+BPAR),
+        # NBASIS_MAX 16, WIDTH 6 / WIDTH_MIN 0.1 / NWIDTH 41, NXGRID 32, NKY 24, NMODES 2.
+        code_settings: "edge"                  # [edge preset]
+        extraOptions: {}
+      read: {}
+      # Scan trick is expensive at the edge and the scan can leave the physical branch;
+      # null falls back to a flat percent_error.
+      use_scan_trick_for_stds: null            # [edge preset]
+      reuse_scan_ball: false
+      keep_files: "base"
+      cores_per_tglf_instance: 1
+      percent_error: 5.0
+      Qi_includes_fast: false
+
+    neo:
+      run:
+        # "edge" preset = ROTATION_MODEL 1 (Haskey low-rotation ordering). Per-rho DPHI0DR is
+        # injected automatically from powerstate_edge.plasma["E_rad"] when this is selected.
+        code_settings: "edge"                  # [edge preset]
+      read: {}
+      percent_error: 10.0
+
+    cgyro:
+      run:
+        code_settings: "Nonlinear"
+        extraOptions: {}
+        run_type: "prep"
+      read:
+        tmin: 0.0
+      Qi_stable_criterion: 0.01
+      Qi_stable_percent_error: 5.0
+      run_base_tglf: true
+
+  profiles_postprocessing_fun: null
+
+  applyCorrections:
+    Ti_thermals: true
+    ni_thermals: true
+    recalculate_ptot: true
+    Tfast_ratio: false
+    force_mach: null
+
+# -----------------------------------------------------------------
+# Target model parameters
+# -----------------------------------------------------------------
+# powerstate_edge overrides `evaluator` with targets_analytic_edge.analytical_model_edge
+# whenever edge_options.use_edge_targets is true (the default).
+# -----------------------------------------------------------------
+
+target:
+
+  evaluator: "import::mitim_modules.powertorch.physics_models.targets_analytic.analytical_model"
+
+  options:
+    targets_evolve: ["qie", "qrad", "qfus"]
+    target_evaluator_method: "powerstate_edge"   # [edge preset]
+    force_zero_particle_flux: false
+    targets_resolution: 20
+    percent_error: 1
+    # Source convention for the tracked impurity (GZ channel):
+    #   "auto" pairs it with edge_options.impurity_representation
+    #          ("charge" for charge_density, "nuclei" for the conserved partition)
+    impurity_source_convention: "auto"
+
+# -----------------------------------------------------------------
+# EDGE PHYSICS OPTIONS
+# -----------------------------------------------------------------
+# Read by portals_edge -> powerstate_edge. Every key is optional; the value shown is the default.
+# Evaluation order inside powerstate_edge.calculate():
+#   1  boundary conditions -> 2 modify(X) -> 3 profile functions -> 3b rotation -> 3c neutrals
+#   -> 3d impurities/charge states -> 4 targets -> 5 transport -> 5b nonlocal -> 6 ELM -> 7 metrics
+# -----------------------------------------------------------------
+
+edge_options:
+
+  # ---------------- Domain ----------------
+  # Trim the plasma grid. domain_roa takes priority over domain_rho. Only the LOWER bound is used.
+  domain_roa: [0.87, 1.0]
+  domain_rho: null
+
+  # ---------------- LCFS boundary conditions ----------------
+  # Initial separatrix anchors, overriding the input.gacode values. Leave {} to read and freeze
+  # the values already in the initial profile (the usual choice for validation runs).
+  lcfs_bc: {}
+  #   te: 0.080     # keV
+  #   ti: 0.080     # keV
+  #   ne: 0.30      # 1e19 m^-3
+  #   aLte: 0.0
+  #   aLti: 0.0
+  #   aLne: 0.0
+
+  # bc_model selects the y-model (n,T at the LCFS) and the aLy-model (their scale lengths).
+  # Dict form is explicit; the legacy strings below are aliases.
+  #   y   : "Fixed" | "TFTP"      (TFTP = two-fluid two-point, back-calculates upstream from targets)
+  #   aLy : "Fixed" | "PeretSSF" | "EichManz" | "Ensemble"   (Ensemble = mean of the latter two)
+  # Aliases: "FixedInitial"/"Fixed" -> {Fixed,Fixed}; "TwoFluid_PeretSSF" -> {TFTP,PeretSSF};
+  #          "TwoFluid_EichManz"/"Tftp_SepOS" -> {TFTP,EichManz}; "Synthesis" -> coupled solver.
+  bc_model: {y: "Fixed", aLy: "Fixed"}
+  # Flat keys apply to all sub-models; nest under "y"/"aLy"/"combined" to target one.
+  bc_model_options: {}
+  #   # combined solver
+  #   max_iter: 100
+  #   tol: 1.0e-3
+  #   damping: 0.5
+  #   Zeff: null            # override the powerstate Zeff at the LCFS
+  #   Lpar: null            # override the parallel connection length [m]
+  #   # Y_TFTP
+  #   ne_target: 3.0        # 1e19 m^-3
+  #   te_target: 0.005      # keV
+  #   ti_target: null       # defaults to te_target
+  #   fq_e: 0.5
+  #   fq_i: 0.5
+  #   fmom: 0.5
+  #   lambda_q_scalar: 1.0
+  #   # aLy_PeretSSF
+  #   G0: 1.25
+  #   shear_ref: 5.0        # + for LSN, - for USN
+  #   f_Delta: 1.0
+  #   Lambda: null          # sheath log factor; computed from me/mi if null
+  #   gfile_path: null      # g-file for equilibrium-derived G0/alpha_s
+  #   eq_n_points: 512
+  #   eq_eddy_width_m: 0.005
+
+  # ---------------- Main-ion neutrals ----------------
+  # "Null" | "Analytic". Analytic writes n0, S_ion_main, nu_ioniz_main, tau_n0, Ge_core_reinject.
+  neutral_model: "Null"
+  neutral_model_options: {}
+  #   source_rate: 1.0e21     # D0 crossing the LCFS inward [s^-1]; sets the n0 amplitude
+  #   mu_amu: 2.014
+  #   include_cx: true        # add analytic CX to the collision frequency in D_n
+  #   two_population: true    # coupled cold (Franck-Condon) + hot (CX) neutrals
+  #   T_cold_eV: 3.0          # Franck-Condon temperature; sets near-separatrix penetration
+  #   Kn_thresh: 0.3          # kinetic/diffusive switch (single-population path only)
+  #   Kn_eval_fraction: 0.3
+  #   verbose: false
+
+  # ---------------- Impurities / charge states ----------------
+  # "Null" | "Aurora". Aurora writes nz_all, qrad_aurora, nu_scd_imp, nu_acd_imp and (by default)
+  # closes the main-ion density by quasineutrality.
+  charge_state_model: "Null"
+  charge_state_model_options: {}
+  #   imp: "C"                      # element symbol
+  #   main_element: "D"
+  #   D_z_m2_s: 0.1                 # uniform impurity diffusivity [m^2/s]
+  #   V_z_m_s: -0.5                 # linear-ramp pinch amplitude, V(r) = V_z_m_s * r/r_lcfs
+  #   aLnZ_profile: null            # scalar or (x, y) on x=r/r_lcfs; REPLACES V_z_m_s as the
+  #                                 # peaking input (a/L_nZ = V(r)/D holds exactly in this model)
+  #   source_rate: 1.0e21           # injection rate [s^-1]; Zeff-1 is LINEAR in it, so one
+  #                                 # measurement calibrates it to the LCFS Zeff
+  #   cxr_flag: false               # charge-exchange recombination (uses plasma["n0"])
+  #   max_dilution_fraction: 1.0
+  #   max_source_rate_iters: 5
+  #   update_ni_charge_balance: true
+  #   main_ion_species_index: 0
+  #   verbose: false
+  # NOTE: unrecognized keys are warned about, not raised. "V0_m_s" is NOT "V_z_m_s".
+
+  # Who owns the impurity DENSITY LEVEL:
+  #   "charge_state_model" : Aurora's steady-state solve. Amplitude anchored by source_rate,
+  #                          which you calibrate to the measured LCFS Zeff.
+  #   "prescribed"         : the initial profile's f_Z carried with ne. Aurora still supplies the
+  #                          charge-state FRACTIONS (radiation, qpar_imp, qpar_Z, Zeff), but its
+  #                          transport solve no longer sets the level, so a Zeff calibration is
+  #                          INERT in this mode.
+  #   (aliases: "experimental", "initial")
+  # Adding "nZ" to predicted_channels overrides both: the DV owns the density and this key only
+  # sets the starting profile.
+  impurity_density_source: "charge_state_model"
+
+  # How the charge-state ladder collapses onto the single GACODE impurity species:
+  #   "charge_density" : n_rep = sum_z z n_z / Z_imp   -> charge density exact (recommended)
+  #   "fully_stripped" : n_rep = n_z(Z_imp)            -> legacy; reproduce archived runs only
+  impurity_representation: "charge_density"
+
+  # Write the exact all-stage Zeff per radius into the transport-code inputs instead of letting
+  # them derive it from the single-species representation (which is high by Z_imp/<Z>: ~9% of
+  # Zeff-1 at the pedestal top, >60% near the LCFS).
+  impurity_zeff_override: true
+
+  # ---------------- Rotation / E_r ----------------
+  # Forwarded to edge_tools.rotation. Produces w0, Er, E_rad (NEO DPHI0DR), vexb, gamma_exb,
+  # vexb_shear (TGLF VEXB_SHEAR), mach, gamma_p, w0_n, aLw0_n — all autodiff-safe on "analytic".
+  rotation_options: {}
+  #   mode: "analytic"              # "analytic" | "vgen" (external NEO DKE solve, non-differentiable)
+  #   K_neo: "sauter"               # neoclassical poloidal-flow coefficient; 0.0 = pure diamagnetic
+  #   oversample: 2                 # refine before differentiating (gamma_E ~ d2phi/dr2 on a coarse grid)
+  #   ln_lambda: 17.0
+  #   smooth_window: 1
+  #   mach_cut2: 0.0
+  #   vtor_source: "zero"           # "zero" | "user" | "extract_initial"
+  #                                 # "zero"            = vtor=0 closure (pure diamagnetic+neo Er)
+  #                                 # "extract_initial" = hold the reconstructed Vtor fixed and let
+  #                                 #                     the diamagnetic Er evolve (recommended for
+  #                                 #                     validation against a measured discharge)
+  #   vtor_pairs: null              # [[rho, vtor_m_s], ...] for vtor_source: "user"
+  #   vtor_extract_smooth: 5        # odd window (grid points) smoothing the backed-out Vtor foot;
+  #                                 # 5-7 useful, >~9 erodes the pedestal-top shear, <=1 disables
+  #   vgen_every: 1                 # re-solve NEO every N calls in "vgen" mode
+  #   vgen_drho: 0.01               # radial spacing of the cropped vgen input.gacode
+  #   vgen_options: {}
+
+  # ---------------- ELM / peeling-ballooning ----------------
+  # "Null" | "AnalyticPB" | "EPED". Multiplies TURBULENT fluxes above the stability boundary.
+  elm_model: "Null"
+  elm_model_options: {}
+  #   stiffness: 10.0            # penalty strength above the boundary
+  #   stiffness_power: 1.0
+  #   s_hat_min: 0.1
+  #   s_peel_frac: 1.5
+  #   roa_min: 0.8               # innermost radius where the penalty applies
+  #   geometry_correction: true  # triangularity / toroidicity factor
+  #   verbose: false
+  #   eped_folder: null          # required for elm_model: "EPED"
+
+  # ---------------- Nonlocal transport corrections ----------------
+  # "Analytic" activates the external per-ky ExB quench + tier-A turbulence spreading; when active,
+  # the transport code is forced shear-free (TGLF VEXB_SHEAR=0/ALPHA_QUENCH=0) so this module owns
+  # ALL ExB physics. Quenched fluxes land in "*_tr_turb" (GP-facing), spread totals in "*_tr_nl"
+  # (solver-facing). The spread matrix is frozen at the first evaluation.
+  nonlocal_model: "Null"
+  nonlocal_model_options: {}
+  #   ExB: true
+  #   Spreading: true
+  #   lambda_c_mult: 8.0            # C in lambda_c = C * rho_s (literature band 5-12)
+  #   kernel: "gauss"               # "gauss" | "lorentzian"
+  #   alpha_e: 1.0                  # Waltz quench-rule constants
+  #   p: 2.0
+  #   spread_lambda_mult: null      # spreading kernel C (default: lambda_c_mult)
+  #   exb_envelope: null            # null = rms smear | "gauss"/"lorentzian"/"curvature"
+  #   exb_envelope_window: [0.85, 1.0]
+  #   gamma_exb_nl_feature: false   # add the smeared shear as a GP INPUT feature
+  #   nonlocal_exb_to_tglf: false   # NOT WIRED
+
+  # ---------------- Targets ----------------
+  # Swap the target evaluator for targets_analytic_edge.analytical_model_edge.
+  use_edge_targets: true
+
+  # Scale a fixed target source at x0 and shift the whole target profile. Keys: Qe, Qi, Ge, GZ, Mt.
+  target_multipliers: {}
+  #   Qe: 1.0
+  #   Qi: 1.0
+  #   Ge: 1.0
+
+  # If true, residuals are normalized by their target: (cal - of)/cal. Forced true (and required)
+  # when ne_flux_channel is "particle".
+  targets_scaled: false
+
+  # How the ne channel residual is defined:
+  #   "convective" : match the convective ENERGY flux Ce = (3/2) Te * Ge  -> every channel in
+  #                  MW/m^2, so the absolute residual is a consistent total-power objective.
+  #   "particle"   : match the raw PARTICLE flux Ge -> de-conflates ne from Te, but the residual
+  #                  is no longer in energy units, so target-normalized residuals are turned on.
+  ne_flux_channel: "convective"
+
+  # ---------------- Surrogate structure ----------------
+  # One GP per turbulent channel spanning the whole domain (samples from all radii pooled in
+  # gyro-Bohm space, with a radial label appended) instead of one GP per radius.
+  global_surrogates: false
+  global_surrogates_options: {}
+  #   extra_features: ["shear"]     # any per-radius powerstate.plasma key, e.g. "vexb_shear"
+
+  # Nonstationary L->H flux surrogate: ln(GB flux) outcome transform + a learnable-knee
+  # physics mean (ITG turn-on vs ExB suppression) + ARD Matern residual, on the turbulent channels.
+  # NOTE the key is `nonstationary_exb` (the module is edge_tools.exb_nonstationary).
+  nonstationary_exb: false
+
+  # Control-point semantics for MtanhSpline when solution.parameterizer_options omits it.
+  defined_on: "aLy"                            # [edge preset]
+
+# -----------------------------------------------------------------
+# Optimization options
+# -----------------------------------------------------------------
+
+optimization_namelist_location: null
+
+optimization_options:
+
+  initialization_options:
+    initial_training: 5
+    initialization_fun: "import::mitim_modules.portals.utils.PORTALSoptimization.initialization_simple_relax"
+    # Relaxation seeder. The edge is stiff: an unclamped seeder overshoots at dx_max_abs.
+    simple_relax_options: {}
+    #   relax: 0.5
+    #   dx_max: 2.0
+    #   dx_min_abs: 1.0e-3
+    #   dx_max_abs: 3.0
+
+  convergence_options:
+    maximum_iterations: 20                     # [edge preset]
+    stopping_criteria: "import::mitim_modules.portals.PORTALStools.stopping_criteria_portals"
+    stopping_criteria_parameters:
+      maximum_value: 1.0e-5                    # [edge preset] absolute, see next key
+      maximum_value_is_rel: false              # [edge preset]
+      minimum_inputs_variation: [10, 5, 0.1]
+      ricci_value: 1.0e-4                      # [edge preset]
+      ricci_d0: 2.0
+      ricci_lambda: 0.5
+    stop_if_no_new_points: true                # [edge preset]
+
+  acquisition_options:
+    relative_improvement_for_stopping: 1.0e-2
+    type: "posterior_mean"
+    optimizers: ["sr", "root"]
+
+  surrogate_options:
+    surrogate_selection: "import::mitim_modules.portals.PORTALStools.surrogate_selection_portals"
+    test_combination_stop_on_failure: false    # [edge preset]
+
+  strategy_options:
+    AllowedExcursions: [0.0, 0.0]

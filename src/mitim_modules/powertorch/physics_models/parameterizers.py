@@ -2414,6 +2414,14 @@ class SplineMtanhAnalytic(ParameterBase):
           the dip-then-peak shape -- it is reachable with all of theta in bounds (c
           moving within _C_BOUNDS is enough), which is why the dip is a projection
           condition and not just a consequence of the bounds.
+
+        Both conditioners mean the APPLIED offset is generally NOT the requested one:
+        the clip can zero individual components (so the applied direction differs) and
+        the bisection scales the amplitude by a state-dependent alpha in [0,1].  A
+        finite-difference caller that divides by the REQUESTED step therefore reports a
+        sensitivity that is wrong by 1/alpha and attributed to the wrong direction.  The
+        applied offset is recorded in ``_theta_offset_applied[prof]`` so the edge-UQ scan
+        can divide by what actually happened (see ``UQState.scan_with_observables``).
         """
         theta = np.asarray(theta, dtype=float)
         offs = getattr(self, "_theta_offset", None)
@@ -2421,15 +2429,25 @@ class SplineMtanhAnalytic(ParameterBase):
         if off is None:
             return theta
         off = np.asarray(off, dtype=float)
+
+        def _record(th_out):
+            """Stash the offset the reconstruction ACTUALLY received."""
+            applied = getattr(self, "_theta_offset_applied", None)
+            if not isinstance(applied, dict):
+                applied = {}
+            applied[prof] = np.asarray(th_out, dtype=float) - theta
+            self._theta_offset_applied = applied
+            return th_out
+
         lo, hi = self._theta_bounds()
         th_full = np.clip(theta + off, lo, hi)
         if y_bc is None or aLy_bc is None:
-            return th_full
+            return _record(th_full)
         # The peak rule and the dip rule are independently switchable: disabling the
         # peak penalty must not silently drop turnover rejection too (they guard
         # different failure modes -- height vs shape).
         if not (self._peak_penalty_on or self._unimodal_proj_on):
-            return th_full
+            return _record(th_full)
 
         # alpha=0 must be feasible for the bisection to be well posed.  The fit-time
         # guard is accept-if-better rather than accept-if-under-cap, so the nominal fit
@@ -2455,7 +2473,7 @@ class SplineMtanhAnalytic(ParameterBase):
             return not (dip_ok and self._has_interior_dip(aLy_p))
 
         if feasible(th_full):
-            return th_full
+            return _record(th_full)
         a_lo, a_hi = 0.0, 1.0
         for _ in range(self.peak_proj_iters):
             a = 0.5 * (a_lo + a_hi)
@@ -2463,7 +2481,7 @@ class SplineMtanhAnalytic(ParameterBase):
                 a_lo = a
             else:
                 a_hi = a
-        return np.clip(theta + a_lo * off, lo, hi)
+        return _record(np.clip(theta + a_lo * off, lo, hi))
 
     def _resolve(self, prof, prof_params):
         bc_y = self.get_nearest_bc(prof, 1.0)

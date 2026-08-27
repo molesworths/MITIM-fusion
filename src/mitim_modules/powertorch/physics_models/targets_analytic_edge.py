@@ -448,8 +448,18 @@ class analytical_model_edge(analytical_model):
             # nu_scd_imp / nu_acd_imp already include ne multiplication (s^-1).
             # S_imp_net = Σ_z z·Ṅ_z is the freed-electron source; it is exact by
             # charge conservation and does NOT require a trace-impurity assumption.
+            # The z-weighting telescopes, leaving Σ_w (S_w n_w − α_w n_w), so both sums are
+            # unweighted -- but they must be taken over the STAGE THAT REACTS, not the same
+            # index. Aurora stores both rate arrays with the pad at the LAST index
+            # (core.py: Sne_rates[:, :-1] = Sne.T, likewise Rne_rates) and indexes them by the
+            # LOWER stage of each transition: Sne_rates[z] ionizes z -> z+1, Rne_rates[z]
+            # recombines z+1 -> z (hence Rne_rates[:, 0] = 0 to block recombination to
+            # neutral). So ionization pairs acd/scd index z with n_z, while recombination out
+            # of stage z pairs index z-1 with n_z. Pairing acd[z] with n_z instead multiplied
+            # the fully stripped population by the zero pad, dropping the single largest
+            # recombination term and leaving a "net" that was ~99.8% gross ionization.
             S_imp_iz  = (scd[:, :, :-1] * nz[:, :, :-1]).sum(dim=-1)
-            S_imp_rec = (acd[:, :,  1:] * nz[:, :,  1:]).sum(dim=-1)
+            S_imp_rec = (acd[:, :, :-1] * nz[:, :, 1:  ]).sum(dim=-1)
             S_imp_net = S_imp_iz - S_imp_rec
 
             p["qpar_imp"] = p["qpar_imp"] + S_imp_net * 0.1

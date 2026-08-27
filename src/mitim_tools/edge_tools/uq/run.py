@@ -120,7 +120,8 @@ def induced_aly_sigma(powerstate, channels, sigma_y):
             for ch in channels if ch in base}
 
 
-def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti, batch=0):
+def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti, batch=0,
+                         scale_to_nominal=True):
     """
     Correlated aLy perturbation directions from PeretSSF, for use with a Fixed
     NOMINAL aLy: the aLy response to a +1-sigma Te and Ti perturbation.  Returns
@@ -136,6 +137,26 @@ def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti, batch=0):
     the LCFS (Te,Ti) uncertainty even when the nominal ``bc_model`` is
     ``{aLy: Fixed}`` and ``bc_model_options`` is empty (the previous FD path
     silently returned zero directions in that case).
+
+    ``scale_to_nominal`` transfers the sensitivity as a LOGARITHMIC derivative
+    rather than an absolute one::
+
+        delta_ch = (d ln aLy_SSF / d ln T) * sigma_T * aLy_nominal
+
+    The whole point of this routine is that the aLy-BC uncertainty is nothing but
+    the LCFS y uncertainty pushed through PeretSSF.  But the derivative is taken at
+    the PeretSSF SOLUTION, while the perturbation is added to whatever nominal aLy
+    the run actually uses -- and with a Fixed nominal those two disagree badly: on
+    the bo_prescribed_nZ discharges the ratio aLy_SSF/aLy_nominal ran from 0.46 to
+    10.3 (worst: HH a/LTi, nominal 2.59 vs SSF 26.8).  Handing over the ABSOLUTE
+    delta then imports the SSF scale as well as its sensitivity, so a 10% Ti error
+    became a 132% a/LTi error and the scan column drove a/LTi to exactly zero.
+
+    The logarithmic sensitivity is the part that genuinely belongs to PeretSSF and
+    it is remarkably stable across discharges (d ln aLTe/d ln Te ~ 0.6,
+    d ln aLTi/d ln Ti ~ 1.2, d ln aLne/d ln Te,Ti ~ 0.7 over all five cases), which
+    is what makes it the transferable quantity.  When the nominal aLy IS PeretSSF
+    the ratio is 1 and this is a no-op, as it must be.
     """
     if not (sigma_te or sigma_ti):
         return []
@@ -177,17 +198,36 @@ def peret_aly_directions(powerstate, channels, sigma_te, sigma_ti, batch=0):
     )
 
     aly_map = {"te": "aLte", "ti": "aLti", "ne": "aLne", "ni": "aLni"}
+    nominal = _read_aly_bc(powerstate, channels) if scale_to_nominal else {}
     delta_te, delta_ti = {}, {}
+    rescaled = {}
     for ch in channels:
         key = aly_map.get(ch)
         if key is None or key not in out:
             continue
         g_te, g_ti = torch.autograd.grad(
             out[key], [te_leaf, ti_leaf], retain_graph=True, allow_unused=True)
+        # Convert the absolute sensitivity to a logarithmic one and re-express it on
+        # the nominal aLy the reconstruction will actually be perturbed around.
+        # ratio = aLy_nominal / aLy_SSF; identically 1 for a PeretSSF nominal.
+        ratio = 1.0
+        if scale_to_nominal:
+            aly_ssf = float(out[key])
+            aly_nom = nominal.get(ch)
+            if aly_nom is not None and abs(aly_ssf) > 1e-12:
+                ratio = float(aly_nom) / aly_ssf
+                if abs(ratio - 1.0) > 1e-6:
+                    rescaled[ch] = (aly_ssf, float(aly_nom), ratio)
         if sigma_te and g_te is not None:
-            delta_te[ch] = float(g_te) * state.te * float(sigma_te)
+            delta_te[ch] = float(g_te) * state.te * float(sigma_te) * ratio
         if sigma_ti and g_ti is not None:
-            delta_ti[ch] = float(g_ti) * state.ti * float(sigma_ti)
+            delta_ti[ch] = float(g_ti) * state.ti * float(sigma_ti) * ratio
+
+    if rescaled:
+        print("[UQ] PeretSSF aLy sensitivity transferred as a LOGARITHMIC derivative "
+              "onto the nominal aLy (aLy_SSF -> aLy_nominal, factor): "
+              + ", ".join(f"{c}: {s:.3g} -> {n:.3g} (x{r:.3g})"
+                          for c, (s, n, r) in rescaled.items()), typeMsg="i")
 
     dirs = []
     if any(abs(v) > 1e-9 for v in delta_te.values()):
@@ -305,6 +345,7 @@ def run_edge_uq(
     fit_error_rel_cap: float = 0.10,
     fit_error_max_dirs=None,
     fit_error_step: float = 0.1,
+    fit_error_min_step: float = 0.01,
     lcfs_aly_mode: str = "auto",
     outlier_factor: float = 8.0,
     outlier_min_ratio: float = 3.0,
@@ -333,6 +374,13 @@ def run_edge_uq(
         that just ran.  "linear" -- cheap jvp + FD, but requires a differentiable
         transport (transport_proxy); not for real TGLF/NEO.
     rel_step   : input-scan step in units of the input sigma (1.0 = 1-sigma corner).
+    fit_error_min_step : floor for the adaptive fit-error step (default 0.01 sigma).
+        A theta direction whose step is driven to the floor is one the parameterizer
+        conditions at ANY amplitude (its theta bounds clip it); such columns are
+        reported and attributed by projection instead of being divided by a step the
+        reconstruction never took.  Do not lower much further: the residual columns
+        divide the real-transport difference by the step, so the floor also sets the
+        worst-case TGLF/NEO noise amplification (1/step).
     do_blackbox: include finite-difference black-box columns (source/D/V).
     use_surrogate_gp : harvest existing ``*_tr_turb_stds`` and re-add them.  Leave
         FALSE for the in-loop real-eval path: those fields already hold the TGLF/NEO
@@ -453,17 +501,22 @@ def run_edge_uq(
                   f"{stale[1]*100:.0f}% from live plasma) -> re-evaluating baseline "
                   "at x0 instead of reusing the last eval", typeMsg="w")
             baseline = None
-        # Adaptive fit-error step: full step (clean flux, no 1/step noise blow-up)
-        # for directions where the reconstruction is linear; small step only for
-        # the few that cross a regime boundary.  Cheap profile-only probes.
+        # Adaptive fit-error step: the largest step at which the parameterizer's
+        # theta conditioner stays a NO-OP (so the evaluated profile really is the
+        # requested direction at the requested amplitude) and the response is still
+        # linear.  Full step wherever possible (clean flux, no 1/step noise blow-up);
+        # shrunk only where the reconstruction would otherwise be re-shaped under us.
+        # Judged per column on ITS OWN channel.  Cheap profile probes, no transport.
         col_steps = {}
         if fit_error_cols:
-            probe_key = "aLne" if "aLne" in powerstate.plasma else \
-                next((f"aL{c}" for c in powerstate.predicted_channels
-                      if f"aL{c}" in powerstate.plasma), None)
-            if probe_key:
-                col_steps = st.fit_step_map(x0, L, fit_error_cols, key=probe_key,
-                                            small_step=fit_error_step)
+            probe_keys = [k for k in
+                          [f"aL{c}" for c in powerstate.predicted_channels]
+                          + list(powerstate.predicted_channels)
+                          if k in powerstate.plasma]
+            if probe_keys:
+                col_steps = st.fit_step_map(
+                    x0, L, fit_error_cols, keys=probe_keys,
+                    small_step=fit_error_step, min_step=fit_error_min_step)
         y0, L_out, obs0, L_obs = st.scan_with_observables(
             x0, L, scan_keys, baseline=baseline, rel_step=rel_step,
             col_steps=col_steps)
@@ -522,6 +575,18 @@ def run_edge_uq(
                 powerstate.plasma[turb_key].shape)
             base_tr = turb_key[:-len("_turb")]        # "..._tr_turb" -> "..._tr"
             inject_into.plasma[base_tr + "_stds"] = sig_tr
+
+            # Same for the TARGET side.  Without this the flux panel's target band
+            # falls back to "{base}_stds", which calculateTargets fills with a flat
+            # relative_error_assumed (percent_error) -- a prescribed number, not a
+            # propagation -- so the plotted target uncertainty was 1% everywhere while
+            # the propagated one reaches ~7% of the target.  PLOT-ONLY key: writing the
+            # propagated std into "{base}_stds" itself would change the target error
+            # the solver's objective consumes, which is a different decision.
+            tar_key = base_tr[:-len("_tr")]           # "..._tr" -> target base
+            if tar_key in L_obs and tar_key in powerstate.plasma:
+                inject_into.plasma[tar_key + "_tar_uq_stds"] = std_from_factor(
+                    L_obs[tar_key]).reshape(powerstate.plasma[tar_key].shape)
 
     # 4b. Per-source uncertainty breakdown: each column of the observable factor
     # is one uncertainty source, so the per-source std contribution is available

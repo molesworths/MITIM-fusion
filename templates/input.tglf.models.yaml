@@ -86,6 +86,6 @@
     WIDTH_MIN: 0.1
     NWIDTH: 41
     NMODES: 2
-    NXGRID: 64
+    NXGRID: 32
     RLNP_CUTOFF: 1000.
     NKY: 24

@@ -171,7 +171,7 @@ class AnalyticPBElm(ElmStability):
     def __init__(self, options: dict):
         super().__init__(options)
         self.stiffness          = float(options.get("stiffness",          10.0))
-        self.stiffness_power    = float(options.get("stiffness_power",    1.0))
+        self.stiffness_power    = float(options.get("stiffness_power",    10.0))
         self.s_hat_min          = float(options.get("s_hat_min",          0.1))
         self.s_peel_frac        = float(options.get("s_peel_frac",        1.5))
         self.roa_min            = float(options.get("roa_min",            0.8))
@@ -368,7 +368,7 @@ class EpedElm(ElmStability):
     def __init__(self, options: dict):
         super().__init__(options)
         self.stiffness = float(options.get("stiffness", 10.0))
-        self.stiffness_power = float(options.get("stiffness_power", 1.0))
+        self.stiffness_power = float(options.get("stiffness_power", 10.0))
         self.roa_min = float(options.get("roa_min", 0.8))
         self.pedestal_top_roa = options.get("pedestal_top_roa", 0.9)
         self.cold_start = bool(options.get("cold_start", False))
@@ -819,9 +819,8 @@ class EpedElm(ElmStability):
             (roa_1d - self.roa_min) / max(1.0 - self.roa_min, 1e-6)
         ).clamp(0.0, 1.0)
 
-        elm_factor = (
-            1.0 + self.stiffness * ramp * (overshoot ** self.stiffness_power)
-        ).to(dtype).to(device)
+        elm_factor = max(1,
+            (1.0 + overshoot) ** self.stiffness_power)
         in_elm_region = (
             (roa_1d >= self.roa_min) & (overshoot > 0.0)
         ).to(device)
@@ -837,7 +836,7 @@ class EpedElm(ElmStability):
             print(
                 f"\t[EpedElm] batch={b}: ELM triggered! "
                 f"p_top_current / p_top_crit = {ratio:.3f}  "
-                f"ELM penalty factor max = {elm_factor.max():.2f}",
+                f"ELM penalty factor max = {elm_factor:.2f}",
                 typeMsg="w",
             )
 

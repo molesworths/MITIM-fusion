@@ -1304,7 +1304,41 @@ def _ci_to_z(ci):
         return 1.6448536269514722
 
 
-def _edge_plot_uq_band(ax, x, y, std, z, color, where=None, mul=1.0):
+def _edge_uq_band_edges(y, std, z, positive=None):
+    """``(lo, hi)`` edges of a ``z``-sigma band around ``y``.
+
+    For a quantity that is positive by construction -- a density, a temperature, or an
+    a/Ly, which the parameterizer itself clips at zero (``get_aLy`` returns
+    ``np.clip(aLy, 0, None)``) -- the additive band ``y +/- z*sigma`` runs negative as
+    soon as ``z*sigma`` reaches ``y``.  A negative density or a negative a/Ly is not a
+    state the model can represent, so the lower edge is clipped at zero: the
+    propagated sigma is left untouched, only the part of the band the model excludes
+    is removed.  A band that reaches the floor is then an honest signal that the
+    linearization has run out of validity at that radius, not a claim that the profile
+    might invert.
+
+    Clipping is preferred to redrawing the band multiplicatively (lognormal with the
+    same relative sigma).  The edge profiles here are not uniformly far from zero --
+    a/Lne and a/LTi both pass through shallow minima inside the pedestal -- and a
+    multiplicative band blows up to (0, inf) there, which is far less readable than a
+    band that simply touches the floor.
+
+    ``positive=None`` auto-detects: clip when every finite ``y`` is >= 0, leave the
+    band alone otherwise, so signed quantities (Er, an inward particle flux, a
+    reversed-rotation w0) are untouched.
+    """
+    y = np.asarray(y, dtype=float)
+    std = np.abs(np.asarray(std, dtype=float))
+    lo, hi = y - z * std, y + z * std
+    finite = np.isfinite(y)
+    if positive is None:
+        positive = bool(finite.any() and np.all(y[finite] >= 0))
+    if positive:
+        lo = np.maximum(lo, 0.0)
+    return lo, hi
+
+
+def _edge_plot_uq_band(ax, x, y, std, z, color, where=None, mul=1.0, positive=None):
     """Fill a ``z``-sigma band around ``y`` (both already in plot units via mul)."""
     if y is None or std is None:
         return
@@ -1312,7 +1346,8 @@ def _edge_plot_uq_band(ax, x, y, std, z, color, where=None, mul=1.0):
     std = np.asarray(std, dtype=float) * abs(mul)
     if y.shape != std.shape:
         return
-    lo, hi = y - z * std, y + z * std
+    # mul may flip the sign (unit conventions); judge positivity on the plotted curve.
+    lo, hi = _edge_uq_band_edges(y, std, z, positive=positive)
     # Tagged so _autoscale_y_for_domain scales to the mean lines, not the (often
     # very wide near the LCFS) UQ band -- the band then simply clips to the axis.
     if where is not None:
@@ -1554,7 +1589,15 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
                             tr_std = tr_turb_std + tr_neoc_std
 
                 if tr_std is not None and idx == indexToMaximize:
-                    axes_flux[j].fill_between(x, tr - z_ci * tr_std, tr + z_ci * tr_std,
+                    # positive=False EXPLICITLY: a flux is a model OUTPUT whose sign is
+                    # physical (Ge an inward pinch, and Qi_tr/Ge_tr are genuinely
+                    # negative over most of the HH domain), so it must not be clipped
+                    # the way a density or an a/Ly is.  Auto-detection would clip
+                    # whenever a case happens to be positive everywhere, which hid that
+                    # the propagated sigma exceeds the flux itself (up to 4.5x on
+                    # Imode Ge_tr) by drawing the band from zero.
+                    lo_tr, hi_tr = _edge_uq_band_edges(tr, tr_std, z_ci, positive=False)
+                    axes_flux[j].fill_between(x, lo_tr, hi_tr,
                                               where=cp_mask, color=col, alpha=0.18)
 
             if tar is not None:
@@ -1562,10 +1605,23 @@ def PORTALSanalyzer_plotMetrics_edge_modern(
                                   label="Target" if idx == self.ibest else None)
                 if idx == indexToMaximize:
                     std_src = uq_power if uq_power is not None else power
-                    tar_std = _edge_extract_profile_1d(std_src, spec["tar_stds"],
-                                                       species_index=species_idx_tr)
+                    # PROPAGATED target std first ("{base}_tar_uq_stds", written by
+                    # run_edge_uq), falling back to "{base}_stds".  That fallback is
+                    # NOT an uncertainty propagation: calculateTargets fills it with a
+                    # flat relative_error_assumed (percent_error, 1% on these runs), so
+                    # plotting it alone showed a prescribed 1% band and none of the
+                    # propagated target uncertainty -- which reaches ~7% of the target
+                    # on HH and is what the edge-UQ pass exists to measure.
+                    tar_std = _edge_extract_profile_1d(
+                        std_src, spec["tar"] + "_tar_uq_stds",
+                        species_index=species_idx_tr)
+                    if tar_std is None:
+                        tar_std = _edge_extract_profile_1d(std_src, spec["tar_stds"],
+                                                           species_index=species_idx_tr)
                     if tar_std is not None:
-                        _edge_plot_uq_band(axes_flux[j], x, tar, tar_std, z_ci, col)
+                        # Same reasoning as the transport band: a target flux is signed.
+                        _edge_plot_uq_band(axes_flux[j], x, tar, tar_std, z_ci, col,
+                                           positive=False)
 
         # --- Col 3: w0 profile ---
         w0 = _edge_extract_profile_1d(power, "w0")
