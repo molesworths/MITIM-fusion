@@ -18,7 +18,8 @@ class qlgyro_model(gyrokinetic_model):
         # ky-aware) are compile-time-enabled in the patched gacode build (cgyro_freq.F90)
         # and fire automatically; the EMA exit stops beating modes early and its reported
         # eigenvalue is validated here post-hoc with the seeded-DMD agreement gate
-        # (see QLGYROtools.dmd_agreement_gate; backtest: ~/projects/qlgyro/README_DMD_BACKTEST.md).
+        # (see QLGYROtools.dmd_agreement_gate; backtest:
+        # mitim_tools/gacode_tools/scripts/qlgyro_dmd/README_DMD_BACKTEST.md).
         # Rejected (under-converged) kys inflate the per-radius flux uncertainties fed to
         # the surrogate. Options: simulation_options["qlgyro"]["dmd"] =
         #   {"enabled": bool, "std_inflation": float, "keep_raw": bool, "gate_options": dict}

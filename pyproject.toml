@@ -89,6 +89,11 @@ mitim_compare_nml = "mitim_tools.misc_tools.scripts.compare_namelist:main"
 mitim_scp = "mitim_tools.misc_tools.scripts.retrieve_files:main"    # e.g. mitim_scp mfews15 --files /home/pablorf/file1 --folders /home/pablorf/folder1
 mitim_check_maestro = "mitim_modules.maestro.scripts.check_maestro:main"
 
+# QLGYRO linear early-exit (DMD agreement gate) backtest -- see gacode_tools/scripts/qlgyro_dmd/
+mitim_qlgyro_dmd_vs_native = "mitim_tools.gacode_tools.scripts.qlgyro_dmd.dmd_vs_native:main"      # --root <dir of qlgyro_* runs>
+mitim_qlgyro_dmd_backtest = "mitim_tools.gacode_tools.scripts.qlgyro_dmd.dmd_backtest:main"        # --root <dir of qlgyro_* runs>
+mitim_qlgyro_dmd_backtest_ql = "mitim_tools.gacode_tools.scripts.qlgyro_dmd.dmd_backtest_ql:main"  # --root <dir of qlgyro_* runs>
+
 # TRANSP
 mitim_trcheck = "mitim_tools.transp_tools.scripts.run_check:main"	        # e.g. mitim_trcheck pablorf
 mitim_trcheck_p = "mitim_tools.transp_tools.scripts.run_check_periodic:main"	# e.g. mitim_trcheck_p pablorf

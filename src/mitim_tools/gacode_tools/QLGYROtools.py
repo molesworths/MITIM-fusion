@@ -17,8 +17,9 @@ from mitim_tools.misc_tools.LOGtools import printMsg as print
 # (HIPREC default flipped to 1). The EMA exit is a STOP signal only: the reported eigenvalue
 # is CGYRO's instantaneous estimate at exit. The gate below cross-checks that estimate with a
 # seeded DMD extraction from the retained field history and flags kys where they disagree
-# (under-converged). Backtested 2026-07-22 on 11 radius-cases (~/projects/qlgyro/
-# README_DMD_BACKTEST.md): at gate-accepted points the eigenvalue is correct 90-98% and QL
+# (under-converged). Backtested 2026-07-22 on 11 radius-cases (see
+# gacode_tools/scripts/qlgyro_dmd/README_DMD_BACKTEST.md): at gate-accepted points the
+# eigenvalue is correct 90-98% and QL
 # weights are converged to <10-20%; raw DMD-dominant (max-gamma) selection is NOT reliable
 # and is not used here.
 # ---------------------------------------------------------------------------------------------
@@ -26,6 +27,44 @@ from mitim_tools.misc_tools.LOGtools import printMsg as print
 # Files a KY_* directory must keep for the DMD gate (pygacode cgyrodata + field history);
 # heavy moment histories and restarts are trimmed on harvest.
 _CGYRO_RAW_TRIM_PATTERNS = ["bin.cgyro.restart*", "bin.cgyro.kxky_n", "bin.cgyro.kxky_e", "bin.cgyro.kxky_v"]
+
+
+def cgyro_field_matrix(sim):
+    """Stack the per-ky CGYRO field time-histories into a complex [space, time] snapshot
+    matrix. Returns (X, split), where split maps each field name to its row range in X
+    (for ES/EM decomposition), or (None, None) if no usable history is present."""
+    imax = np.asarray(sim.t).size
+    blocks, split, i0 = [], {}, 0
+    for name in ("kxky_phi", "kxky_apar", "kxky_bpar"):
+        arr = getattr(sim, name, None)
+        if arr is None:
+            continue
+        arr = np.asarray(arr)
+        if arr.ndim == 5:  # (2, nr, ntheta, nn, ntime) real/imag split
+            y = arr[0, :, :, 0, :imax] + 1j * arr[1, :, :, 0, :imax]
+        elif arr.ndim == 4:  # (nr, ntheta, nn, ntime) complex
+            y = arr[:, :, 0, :imax]
+        else:
+            continue
+        y = y.reshape(-1, y.shape[-1])
+        if y.shape[-1] < 8 or np.max(np.abs(y)) < 1e-30:
+            continue
+        blocks.append(y)
+        split[name] = (i0, i0 + y.shape[0])
+        i0 += y.shape[0]
+    if not blocks:
+        return None, None
+    return np.vstack(blocks), split
+
+
+def hankel_embed(X, delay):
+    """Time-delay embed [space, time] -> [space*delay, time-delay+1]. Augments the spatial
+    basis so DMD can resolve modes from a rank-1-dominated (growing) linear signal; the
+    eigenvalues are unchanged, the conditioning improves. Returns (Xh, delay_used)."""
+    ns, nt = X.shape
+    if nt <= delay + 2:
+        return X, 1
+    return np.vstack([X[:, i:nt - delay + 1 + i] for i in range(delay)]), delay
 
 
 def _dmd_eigenvalues(kydir, delay=6, rank=10):
@@ -47,35 +86,17 @@ def _dmd_eigenvalues(kydir, delay=6, rank=10):
     if t.size < 20:
         return None, "record too short"
 
-    blocks = []
-    for name in ("kxky_phi", "kxky_apar", "kxky_bpar"):
-        arr = getattr(sim, name, None)
-        if arr is None:
-            continue
-        arr = np.asarray(arr)
-        if arr.ndim == 5:  # (2, nr, ntheta, nn, ntime) real/imag split
-            y = arr[0, :, :, 0, :t.size] + 1j * arr[1, :, :, 0, :t.size]
-        elif arr.ndim == 4:  # (nr, ntheta, nn, ntime) complex
-            y = arr[:, :, 0, :t.size]
-        else:
-            continue
-        y = y.reshape(-1, y.shape[-1])
-        if y.shape[-1] >= 8 and np.max(np.abs(y)) > 1e-30:
-            blocks.append(y)
-    if not blocks:
+    X, _ = cgyro_field_matrix(sim)
+    if X is None:
         return None, "no usable field history (HIPREC_FLAG=0 build?)"
 
-    X = np.vstack(blocks)
     n = X.shape[1]
     i0 = n // 3  # drop transient
     Xw = X[:, i0:]
     if Xw.shape[1] < 12:
         return None, "post-transient window too short"
 
-    # Hankel time-delay embedding: improves conditioning of a rank-1-dominated growing signal
-    ns, nt = Xw.shape
-    if nt > delay + 2:
-        Xw = np.vstack([Xw[:, i:nt - delay + 1 + i] for i in range(delay)])
+    Xw, _ = hankel_embed(Xw, delay)
 
     dt = t[1] - t[0]
     d = DMD(svd_rank=min(rank, Xw.shape[1] - 2, Xw.shape[0]))
